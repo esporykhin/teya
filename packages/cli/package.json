@@ -1,0 +1,39 @@
+{
+  "name": "@teya/cli",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "teya": "./dist/index.js"
+  },
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts",
+    "dev": "tsup src/index.ts --format esm --dts --watch"
+  },
+  "dependencies": {
+    "@teya/core": "workspace:*",
+    "@teya/providers": "workspace:*",
+    "@teya/tools": "workspace:*",
+    "@teya/orchestrator": "workspace:*",
+    "@teya/context": "workspace:*",
+    "@teya/memory": "workspace:*",
+    "@teya/transport-cli": "workspace:*",
+    "@teya/transport-telegram": "workspace:*",
+    "@teya/skills": "workspace:*",
+    "@teya/tracing": "workspace:*",
+    "@teya/scheduler": "workspace:*",
+    "@teya/eval": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.2",
+    "tsup": "^8.0.0",
+    "typescript": "^5.9.0"
+  }
+}

@@ -1,0 +1,145 @@
+/**
+ * @description core:memory — unified knowledge graph tool.
+ *
+ * Actions:
+ *   read    — search memory by query or entity name
+ *   write   — save a fact about an entity
+ *   search  — semantic + keyword search
+ *   entities — list known entities
+ *   relate  — create relation between entities
+ *   update  — supersede an old fact with a new one
+ */
+import type { KnowledgeGraph } from './knowledge.js'
+
+export function createMemoryTools(kg: KnowledgeGraph) {
+  const memoryTool = {
+    name: 'core:memory',
+    description: `Long-term memory. Actions:
+  read    — look up an entity's facts and relations
+  write   — save a fact about an entity (auto-dedup)
+  search  — find facts by keyword or semantic query
+  entities — list all known entities
+  relate  — link two entities
+  update  — replace an outdated fact`,
+    parameters: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['read', 'write', 'search', 'entities', 'relate', 'update'],
+          description: 'Action to perform',
+        },
+        // For read/search
+        query: { type: 'string', description: 'Search query or entity name (read/search)' },
+        // For write
+        entity_name: { type: 'string', description: 'Entity name (write/read/relate)' },
+        entity_type: { type: 'string', description: 'Entity type: person, project, company, concept, preference (write)' },
+        fact: { type: 'string', description: 'Fact to save (write) or new fact (update)' },
+        tags: { type: 'array', items: { type: 'string' }, description: 'Tags (write)' },
+        // For relate
+        from: { type: 'string', description: 'Source entity name (relate)' },
+        to: { type: 'string', description: 'Target entity name (relate)' },
+        relation: { type: 'string', description: 'Relation type: uses, works_on, prefers, etc. (relate)' },
+        // For update
+        fact_id: { type: 'number', description: 'Old fact ID to supersede (update)' },
+        // For entities
+        type: { type: 'string', description: 'Filter entities by type (entities)' },
+      },
+      required: ['action'],
+    },
+    source: 'builtin' as const,
+    cost: {
+      latency: 'instant' as const,
+      tokenCost: 'low' as const,
+      sideEffects: false, // read-heavy, write actions have side effects but that's action-dependent
+      reversible: true,
+      external: false,
+    },
+    execute: async (args: Record<string, unknown>): Promise<string> => {
+      const action = args.action as string
+
+      switch (action) {
+        case 'read': {
+          const entityName = (args.entity_name || args.query) as string
+          if (!entityName) return 'Need entity_name or query for read action.'
+
+          const entity = kg.getEntity(entityName)
+          if (!entity) return `No entity found: "${entityName}". Try action=search.`
+
+          const facts = kg.getEntityFacts(entity.id)
+          const related = kg.getRelated(entity.id)
+          return [
+            `${entity.name} (${entity.type})${entity.description ? ': ' + entity.description : ''}`,
+            facts.length > 0 ? '\nFacts:' : '',
+            ...facts.map(f => `- ${f.content}${f.tags.length ? ` [${f.tags.join(', ')}]` : ''}`),
+            related.length > 0 ? '\nRelations:' : '',
+            ...related.map(r => `- ${r.direction === 'from' ? '->' : '<-'} ${r.relation} ${r.entity.name}`),
+          ].filter(Boolean).join('\n')
+        }
+
+        case 'write': {
+          const entityName = args.entity_name as string
+          if (!entityName) return 'Need entity_name for write action.'
+          const fact = args.fact as string
+          if (!fact) return 'Need fact for write action.'
+
+          const entityType = (args.entity_type as string) || 'generic'
+          const tags = (args.tags as string[]) || []
+          const entityId = kg.addEntity(entityName, entityType)
+          const factId = await kg.addFact(entityId, fact, tags)
+          return `Saved: [${entityName}] ${fact} (fact #${factId})`
+        }
+
+        case 'search': {
+          const query = args.query as string
+          if (!query) return 'Need query for search action.'
+
+          const results = await kg.search(query)
+          if (results.length === 0) return 'No relevant facts found.'
+          return results.map(r => `[${r.entity.name}] ${r.fact.content}`).join('\n')
+        }
+
+        case 'entities': {
+          const type = args.type as string | undefined
+          const entities = kg.listEntities(type)
+          if (entities.length === 0) return type ? `No entities of type "${type}".` : 'Memory is empty.'
+          return entities.map(e => {
+            const facts = kg.getEntityFacts(e.id)
+            return `${e.name} (${e.type}) — ${facts.length} facts`
+          }).join('\n')
+        }
+
+        case 'relate': {
+          const from = args.from as string
+          const to = args.to as string
+          const rel = args.relation as string
+          if (!from || !to || !rel) return 'Need from, to, and relation for relate action.'
+
+          const fromEntity = kg.getEntity(from)
+          const toEntity = kg.getEntity(to)
+          if (!fromEntity) return `Entity "${from}" not found. Create it first with write.`
+          if (!toEntity) return `Entity "${to}" not found. Create it first with write.`
+
+          const relId = kg.addRelation(fromEntity.id, toEntity.id, rel)
+          return `Linked: ${from} -[${rel}]-> ${to} (relation #${relId})`
+        }
+
+        case 'update': {
+          const factId = args.fact_id as number
+          const newFact = args.fact as string
+          if (!factId || !newFact) return 'Need fact_id and fact for update action.'
+
+          const tags = (args.tags as string[]) || []
+          const newId = await kg.supersedeFact(factId, newFact, tags)
+          return `Updated: fact #${factId} superseded by #${newId}: ${newFact}`
+        }
+
+        default:
+          return `Unknown action: ${action}. Use: read, write, search, entities, relate, update`
+      }
+    },
+  }
+
+  // Return both compound tool and legacy names for backward compatibility during transition
+  return { memoryTool, memoryRead: memoryTool, memoryWrite: memoryTool }
+}

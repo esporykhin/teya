@@ -1,0 +1,135 @@
+# Core tools e2e eval suite
+# Tests real agent execution with real LLM — no mocks.
+# Run: teya eval run evals/core-tools.yaml
+
+suite: core-tools
+description: E2E tests for core agent tools — files, memory, tasks, web
+
+setup:
+  - rm -rf ~/.teya/workspace/test-eval/
+  - mkdir -p ~/.teya/workspace/test-eval/
+
+teardown:
+  - rm -rf ~/.teya/workspace/test-eval/
+
+cases:
+  # ── core:files ──────────────────────────────────────────────
+
+  - name: "files:write — creates file with content"
+    input: "Write exactly this text to test-eval/hello.txt: 'Hello from eval test'"
+    expected:
+      tool_called: core:files
+      file_exists: test-eval/hello.txt
+      file_contains:
+        - path: test-eval/hello.txt
+          contains: "Hello from eval test"
+      max_turns: 3
+
+  - name: "files:write — long content survives parsing"
+    input: "Write a 500-word essay about artificial intelligence to test-eval/essay.md. Start with the heading '# AI Essay'."
+    expected:
+      tool_called: core:files
+      file_exists: test-eval/essay.md
+      file_contains:
+        - path: test-eval/essay.md
+          contains: "# AI Essay"
+      file_size:
+        path: test-eval/essay.md
+        min: 1000
+      max_turns: 5
+
+  - name: "files:read — reads existing file"
+    input: "Read the file test-eval/hello.txt and tell me what it says"
+    expected:
+      tool_called: core:files
+      response_contains: "Hello from eval test"
+      max_turns: 3
+
+  - name: "files:list — lists workspace directory"
+    input: "List the files in the test-eval directory"
+    expected:
+      tool_called: core:files
+      response_contains: hello.txt
+      max_turns: 3
+
+  - name: "files:find — finds files by pattern"
+    input: "Find all .txt files in test-eval"
+    expected:
+      tool_called: core:files
+      response_contains: hello.txt
+      max_turns: 3
+
+  # ── core:memory ─────────────────────────────────────────────
+
+  - name: "memory:write — saves a fact"
+    input: "Remember that my favorite programming language is Rust"
+    expected:
+      tool_called: core:memory
+      response_not_contains: "Error"
+      max_turns: 3
+
+  - name: "memory:read — retrieves saved fact"
+    input: "What is my favorite programming language?"
+    expected:
+      tool_called: core:memory
+      response_contains: Rust
+      max_turns: 3
+
+  # ── core:tasks ──────────────────────────────────────────────
+
+  - name: "tasks:create — creates a basic task"
+    input: "Create a task: Review the quarterly report, priority high"
+    expected:
+      tool_called: core:tasks
+      response_not_contains: "Error"
+      response_not_contains: "not found"
+      max_turns: 3
+
+  - name: "tasks:create — creates a scheduled task"
+    input: "Create a recurring task: Check server uptime every day at 9am, assign to monitor agent, with prompt 'Check if all services are responding on port 443'"
+    expected:
+      tool_called: core:tasks
+      response_contains: "cron"
+      max_turns: 3
+
+  - name: "tasks:list — shows tasks"
+    input: "Show me all my tasks"
+    expected:
+      tool_called: core:tasks
+      response_contains: "quarterly report"
+      max_turns: 3
+
+  # ── core:web ────────────────────────────────────────────────
+
+  - name: "web:search — searches the internet"
+    input: "Search the web for 'OpenAI GPT-4 release date'"
+    expected:
+      tool_called: core:web
+      response_not_contains: "Error"
+      max_turns: 3
+
+  - name: "web:fetch — reads a web page"
+    input: "Fetch the content of https://httpbin.org/get and tell me the origin IP"
+    expected:
+      tool_called: core:web
+      response_not_contains: "Error"
+      max_turns: 3
+
+  # ── Compound behavior ───────────────────────────────────────
+
+  - name: "multi-tool — write then read"
+    input: "Write 'test-data-12345' to test-eval/verify.txt, then read it back and confirm it says test-data-12345"
+    expected:
+      tool_called:
+        - core:files
+      file_exists: test-eval/verify.txt
+      response_contains: "test-data-12345"
+      max_turns: 5
+
+  - name: "no hallucination — nonexistent file"
+    input: "Read the file test-eval/nonexistent-xyz-999.txt"
+    expected:
+      tool_called: core:files
+      response_contains: "Error"
+      response_not_contains: "content of the file is"
+      max_turns: 3

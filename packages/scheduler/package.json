@@ -1,0 +1,33 @@
+{
+  "name": "@teya/scheduler",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "teya-scheduler": "./dist/daemon.js"
+  },
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsup src/index.ts src/daemon.ts --format esm --dts"
+  },
+  "dependencies": {
+    "@teya/core": "workspace:*",
+    "@teya/providers": "workspace:*",
+    "@teya/tools": "workspace:*",
+    "@teya/orchestrator": "workspace:*",
+    "@teya/memory": "workspace:*",
+    "better-sqlite3": "^12.8.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.0.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.9.0"
+  }
+}
