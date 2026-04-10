@@ -6,6 +6,6 @@
   "types": "./dist/index.d.ts",
   "exports": { ".": { "import": "./dist/index.js", "types": "./dist/index.d.ts" } },
   "scripts": { "build": "tsup src/index.ts --format esm --dts" },
-  "dependencies": { "@teya/core": "workspace:*", "grammy": "^1.35.0" },
+  "dependencies": { "@teya/core": "workspace:*", "grammy": "^1.35.0", "telegram": "^2.26.22", "big-integer": "^1.6.52" },
   "devDependencies": { "tsup": "^8.0.0", "typescript": "^5.9.0", "@types/node": "^22.0.0" }
 }

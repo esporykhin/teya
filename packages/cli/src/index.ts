@@ -13,7 +13,7 @@ import { openrouter, ollama, withToolAdapter } from '@teya/providers'
 import { createToolRegistry, registerBuiltins, createMCPManager, createDynamicToolLoader, closeBrowser, initWorkspace, getWorkspaceInfo } from '@teya/tools'
 import { AgentRegistry, createDelegateTool } from '@teya/orchestrator'
 import { CLITransport } from '@teya/transport-cli'
-import { TelegramTransport } from '@teya/transport-telegram'
+import { TelegramTransport, TelegramUserbotTransport, createTelegramTool } from '@teya/transport-telegram'
 import { SessionStore, KnowledgeGraph, createMemoryTools, AssetStore, createAssetTools, ollamaEmbeddings } from '@teya/memory'
 import type { SessionState } from '@teya/core'
 import { AgentTracer, consoleExporter, jsonExporter } from '@teya/tracing'
@@ -85,6 +85,18 @@ async function interactiveSetup(): Promise<{ provider: string; model: string; ap
 
 // Check for subcommands before main agent loop
 const subcommand = process.argv[2]
+
+// teya telegram login | logout | status | doctor
+if (subcommand === 'telegram') {
+  const action = process.argv[3] || 'help'
+  const { runTelegramSubcommand } = await import('./telegram-cli.js')
+  await runTelegramSubcommand(action, process.argv.slice(4), {
+    configFile: CONFIG_FILE,
+    loadSavedConfig,
+    saveConfig,
+  })
+  process.exit(0)
+}
 
 if (subcommand === 'skill') {
   const action = process.argv[3]
@@ -363,15 +375,55 @@ async function main() {
   // Create transport
   const telegramToken = args['telegram-token'] || process.env.TELEGRAM_BOT_TOKEN || saved.telegramToken || ''
 
-  let transport: CLITransport | TelegramTransport
-  const isTelegram = transportType === 'telegram'
+  let transport: CLITransport | TelegramTransport | TelegramUserbotTransport
+  const transportKind = transportType as 'cli' | 'telegram' | 'telegram-userbot'
+  const isTelegramAny = transportKind === 'telegram' || transportKind === 'telegram-userbot'
 
-  if (isTelegram) {
+  if (transportKind === 'telegram') {
     if (!telegramToken) {
       console.error('Telegram token required. Use --telegram-token or set TELEGRAM_BOT_TOKEN')
       process.exit(1)
     }
     transport = new TelegramTransport({ token: telegramToken })
+  } else if (transportKind === 'telegram-userbot') {
+    const apiIdRaw = args['telegram-api-id'] || process.env.TELEGRAM_API_ID || saved.telegramApiId || ''
+    const apiHash = args['telegram-api-hash'] || process.env.TELEGRAM_API_HASH || saved.telegramApiHash || ''
+    const sessionString = args['telegram-session'] || process.env.TELEGRAM_SESSION || saved.telegramUserbotSession || ''
+    const allowedRaw = args['telegram-allowed-chats'] || process.env.TELEGRAM_ALLOWED_CHATS || saved.telegramAllowedChats || ''
+    const triggerPrefix = args['telegram-trigger'] || process.env.TELEGRAM_TRIGGER || saved.telegramTrigger || ''
+
+    if (!apiIdRaw || !apiHash) {
+      console.error('Telegram userbot requires --telegram-api-id and --telegram-api-hash (get them at https://my.telegram.org/apps).')
+      console.error('You can also set TELEGRAM_API_ID / TELEGRAM_API_HASH or save them in ~/.teya/config.json.')
+      process.exit(1)
+    }
+    const apiId = Number(apiIdRaw)
+    if (!Number.isFinite(apiId)) {
+      console.error(`Invalid --telegram-api-id: ${apiIdRaw}`)
+      process.exit(1)
+    }
+
+    const allowedChatIds = allowedRaw
+      ? allowedRaw.split(',').map((s: string) => s.trim()).filter(Boolean)
+      : undefined
+
+    transport = new TelegramUserbotTransport({
+      apiId,
+      apiHash,
+      sessionString: sessionString || undefined,
+      allowedChatIds,
+      triggerPrefix: triggerPrefix || undefined,
+      onSession: async (newSession: string) => {
+        const cur = await loadSavedConfig()
+        cur.telegramApiId = String(apiId)
+        cur.telegramApiHash = apiHash
+        cur.telegramUserbotSession = newSession
+        if (allowedRaw) cur.telegramAllowedChats = allowedRaw
+        if (triggerPrefix) cur.telegramTrigger = triggerPrefix
+        await saveConfig(cur)
+        console.log(`\x1b[32m[telegram-userbot] Session saved to ${CONFIG_FILE}\x1b[0m`)
+      },
+    })
   } else {
     transport = new CLITransport()
     // Pass agent list for @mention autocomplete
@@ -380,9 +432,22 @@ async function main() {
     )
   }
 
+  // When the userbot transport is active, give the agent full Telegram control
+  // via the core:telegram tool — reuses the same authenticated MTProto client.
+  if (transportKind === 'telegram-userbot') {
+    const { resolveWorkspacePath, getWorkspaceRoot } = await import('@teya/tools')
+    toolRegistry.register(
+      createTelegramTool((transport as TelegramUserbotTransport).client, {
+        resolvePath: (p, mode) => resolveWorkspacePath(p, mode),
+        workspaceRoot: getWorkspaceRoot(),
+      }),
+    )
+    toolLoader.setTools(toolRegistry.list())
+  }
+
   let abortController: AbortController | null = null
 
-  if (!isTelegram) {
+  if (!isTelegramAny) {
     (transport as CLITransport).onCommand(async (command: string) => {
       switch (command) {
         case '/help': {
@@ -562,7 +627,7 @@ async function main() {
       console.error(`\nFatal error: ${msg}`)
     } finally {
       abortController = null
-      if (!isTelegram) (transport as CLITransport).prompt()
+      if (!isTelegramAny) (transport as CLITransport).prompt()
     }
   })
 
