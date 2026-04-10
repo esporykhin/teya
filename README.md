@@ -64,11 +64,28 @@ teya --provider ollama --model qwen3:8b
 teya --provider openrouter --api-key YOUR_KEY
 ```
 
-### Telegram
+### Telegram Bot
 
 ```bash
 teya --transport telegram --telegram-token BOT_TOKEN
 ```
+
+### Telegram Userbot (MTProto)
+
+Connect your real Telegram account -- Teya reads and writes messages as you, no bot needed.
+
+```bash
+# First time: interactive login (phone + code + optional 2FA)
+teya telegram login
+
+# Run
+teya --transport telegram-userbot
+```
+
+Requires `api_id` and `api_hash` from [my.telegram.org/apps](https://my.telegram.org/apps).
+By default responds only in Saved Messages. Use `--telegram-allowed-chats` to whitelist chats or `--telegram-trigger "!t "` to invoke via prefix in any chat.
+
+See [transport-telegram/README.md](packages/transport-telegram/README.md) for full setup guide.
 
 ### Scheduler
 
@@ -113,7 +130,7 @@ The main agent sees all sub-agents and delegates automatically when the task mat
 | `tracing` | OTEL spans, console/JSON/OTLP exporters |
 | `eval` | E2E test runner, side-effect scoring |
 | `transport-cli` | Terminal UI, image paste, @mentions |
-| `transport-telegram` | Telegram bot |
+| `transport-telegram` | Telegram bot + userbot (MTProto) |
 | `context` | Context window management, condensation |
 | `data` | YAML schema to SQLite CRUD |
 | `cli` | Entry point, config, subcommands |
