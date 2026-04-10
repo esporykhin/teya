@@ -175,6 +175,24 @@ export class TaskStore {
     return this.get(id)!
   }
 
+  /** Like create() but with a caller-supplied stable ID. Uses INSERT OR IGNORE for idempotency. */
+  createWithId(id: string, input: CreateTaskInput): Task {
+    const now = new Date().toISOString()
+
+    this.db.prepare(`
+      INSERT OR IGNORE INTO tasks (id, title, description, status, priority, created_by, assignee, due_at, cron, prompt, tags, timezone, max_retries, timeout_ms, created_at, updated_at)
+      VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id, input.title, input.description || '', input.priority || 'medium',
+      input.createdBy || 'system', input.assignee || null, input.dueAt || null,
+      input.cron || null, input.prompt || null, JSON.stringify(input.tags || []),
+      input.timezone || 'Europe/Moscow', input.maxRetries || 0,
+      input.timeoutMs || 120000, now, now,
+    )
+
+    return this.get(id)!
+  }
+
   get(id: string): Task | null {
     const row = this.db.prepare('SELECT * FROM tasks WHERE id = ?').get(id) as any
     return row ? this.rowToTask(row) : null

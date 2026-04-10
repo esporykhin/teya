@@ -22,6 +22,7 @@ const COMMANDS = [
   { name: '/help',    description: 'Show commands' },
   { name: '/compact', description: 'Clear context (keep session)' },
   { name: '/img',     description: 'Send clipboard image to agent' },
+  { name: '/update',  description: 'Update Teya to latest version' },
   { name: '/exit',    description: 'Exit Teya' },
 ]
 

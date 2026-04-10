@@ -29,6 +29,7 @@
     "@teya/skills": "workspace:*",
     "@teya/tracing": "workspace:*",
     "@teya/scheduler": "workspace:*",
+    "@teya/data": "workspace:*",
     "@teya/eval": "workspace:*"
   },
   "devDependencies": {

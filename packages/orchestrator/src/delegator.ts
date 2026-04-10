@@ -5,8 +5,10 @@ import { agentLoop, buildSystemPrompt } from '@teya/core'
 import type { LLMProvider, AgentEvent } from '@teya/core'
 import { createToolRegistry, registerBuiltins } from '@teya/tools'
 import { openrouter, ollama, withToolAdapter } from '@teya/providers'
+import { DataStore, createDataTools } from '@teya/data'
 import type { AgentTracer } from '@teya/tracing'
 import type { AgentDef } from './registry.js'
+import { join } from 'path'
 
 export interface DelegateOptions {
   tracer?: AgentTracer
@@ -50,6 +52,12 @@ export async function delegateTask(
   const toolRegistry = createToolRegistry()
   registerBuiltins(toolRegistry)
 
+  // Register namespaced core:data — sub-agent sees only its own tables + granted
+  const dataDbPath = join(process.env.HOME || '.', '.teya', 'data.db')
+  const dataStore = new DataStore(dataDbPath, agent.id)
+  const dataTools = createDataTools(dataStore)
+  toolRegistry.register(dataTools.dataTool)
+
   const systemPrompt = await buildSystemPrompt({
     agentDir: agent.dir,
     personality: agent.config.personality,
@@ -85,5 +93,6 @@ export async function delegateTask(
     return delegateResult
   } finally {
     clearTimeout(timer)
+    dataStore.close()
   }
 }

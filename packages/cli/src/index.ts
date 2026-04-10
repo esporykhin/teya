@@ -18,6 +18,7 @@ import { SessionStore, KnowledgeGraph, createMemoryTools, AssetStore, createAsse
 import type { SessionState } from '@teya/core'
 import { AgentTracer, consoleExporter, jsonExporter } from '@teya/tracing'
 import { TaskStore, createTaskTools, HealthManager } from '@teya/scheduler'
+import { DataStore, createDataTools } from '@teya/data'
 
 const CONFIG_DIR = join(process.env.HOME || process.env.USERPROFILE || '.', '.teya')
 const CONFIG_FILE = join(CONFIG_DIR, 'config.json')
@@ -142,6 +143,26 @@ if (subcommand === 'skill') {
   process.exit(0)
 }
 
+// Self-update subcommand
+if (subcommand === 'update') {
+  const { selfUpdate } = await import('./self-update.js')
+  const result = await selfUpdate((msg) => console.log(msg))
+  if (result.success) {
+    if (result.needsRestart) {
+      console.log(`\n\x1b[32mUpdated successfully: ${result.beforeRef} -> ${result.afterRef}\x1b[0m`)
+      console.log(`${result.changes.length} new commits:`)
+      for (const c of result.changes.slice(0, 10)) console.log(`  ${c}`)
+      if (result.changes.length > 10) console.log(`  ... and ${result.changes.length - 10} more`)
+    } else {
+      console.log('\x1b[32mAlready up to date.\x1b[0m')
+    }
+  } else {
+    console.error(`\x1b[31mUpdate failed: ${result.error}\x1b[0m`)
+    process.exit(1)
+  }
+  process.exit(0)
+}
+
 // Scheduler subcommand
 if (subcommand === 'scheduler') {
   const { handleSchedulerCommand } = await import('@teya/scheduler')
@@ -161,6 +182,7 @@ if (subcommand === 'eval') {
     const { buildSystemPrompt } = await import('@teya/core')
     const { KnowledgeGraph, createMemoryTools } = await import('@teya/memory')
     const { TaskStore, createTaskTools } = await import('@teya/scheduler')
+    const { DataStore, createDataTools } = await import('@teya/data')
 
     const saved = await loadSavedConfig()
     const provType = process.argv.find(a => a === '--provider')
@@ -187,6 +209,10 @@ if (subcommand === 'eval') {
     const taskTools = createTaskTools(taskStore)
     toolRegistry.register(taskTools.tasksTool)
     toolRegistry.register(taskTools.scheduleTool)
+
+    const dataStore = new DataStore(join(process.env.HOME || '.', '.teya', 'data.db'), 'teya')
+    const dataTools = createDataTools(dataStore)
+    toolRegistry.register(dataTools.dataTool)
 
     const systemPrompt = await buildSystemPrompt({ agentDir: process.cwd() })
     const suite = await loadEvalSuite(suitePath)
@@ -303,7 +329,12 @@ async function main() {
   toolRegistry.register(taskTools.tasksTool)     // core:tasks (create, list, update, get, delete)
   toolRegistry.register(taskTools.scheduleTool)  // core:schedule (list, pause, resume, trigger, delete)
 
-  process.on('exit', () => { kg.close(); assetStore.close(); taskStore.close() })
+  // Initialize data store and register data tools
+  const dataStore = new DataStore(join(CONFIG_DIR, 'data.db'), 'teya')
+  const dataTools = createDataTools(dataStore)
+  toolRegistry.register(dataTools.dataTool)      // core:data (create_table, insert, upsert, list, schema, sql, ...)
+
+  process.on('exit', () => { kg.close(); assetStore.close(); taskStore.close(); dataStore.close() })
 
   // Connect MCP server if --mcp flag is provided
   const mcpManager = createMCPManager()
@@ -461,6 +492,7 @@ async function main() {
             ['/model',   'Show/change model'],
             ['/help',    'Show commands'],
             ['/compact', 'Clear context (keep session)'],
+            ['/update',  'Update to latest version'],
             ['/exit',    'Exit Teya'],
           ]
           for (const [name, desc] of cmds) {
@@ -542,6 +574,30 @@ async function main() {
           conversationHistory = []
           console.log('\x1b[90mContext cleared. Session preserved.\x1b[0m\n')
           break
+
+        case '/update': {
+          console.log('')
+          const { selfUpdate, restartProcess } = await import('./self-update.js')
+          const result = await selfUpdate((msg) => console.log(`\x1b[90m${msg}\x1b[0m`))
+          if (result.success) {
+            if (result.needsRestart && result.entryPoint) {
+              console.log(`\n\x1b[32mUpdated: ${result.beforeRef} -> ${result.afterRef} (${result.changes.length} commits)\x1b[0m`)
+              for (const c of result.changes.slice(0, 5)) console.log(`  \x1b[90m${c}\x1b[0m`)
+              if (result.changes.length > 5) console.log(`  \x1b[90m... and ${result.changes.length - 5} more\x1b[0m`)
+              console.log('\n\x1b[90mRestarting...\x1b[0m\n')
+              // Close databases before restart
+              kg.close(); assetStore.close(); taskStore.close(); dataStore.close()
+              await mcpManager.disconnectAll()
+              await closeBrowser()
+              restartProcess(result.entryPoint)
+            } else {
+              console.log('\x1b[32mAlready up to date.\x1b[0m\n')
+            }
+          } else {
+            console.log(`\x1b[31mUpdate failed: ${result.error}\x1b[0m\n`)
+          }
+          break
+        }
 
         default:
           console.log(`\nUnknown command: ${command}. Type /help\n`)

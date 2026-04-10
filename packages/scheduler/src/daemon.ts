@@ -21,6 +21,7 @@ import { CronEngine } from './cron-engine.js'
 import { DaemonExecutor } from './daemon-executor.js'
 import { IPCServer } from './ipc.js'
 import { HealthManager } from './health.js'
+import { ensureBuiltinTasks } from './builtin-tasks.js'
 import { AgentRegistry } from '@teya/orchestrator'
 import { KnowledgeGraph, SessionStore as MemSessionStore, batchSummarize, extractDailyKnowledge } from '@teya/memory'
 import { openrouter } from '@teya/providers'
@@ -56,6 +57,10 @@ async function main(): Promise<void> {
   if (orphaned > 0) log(`Cleaned ${orphaned} orphaned executions`)
   const pruned = store.pruneExecutions(30)
   if (pruned > 0) log(`Pruned ${pruned} old execution records`)
+
+  // 3a. Ensure built-in tasks exist (idempotent)
+  const builtinsCreated = ensureBuiltinTasks(store)
+  if (builtinsCreated > 0) log(`Registered ${builtinsCreated} built-in tasks`)
 
   // 4. Agent registry
   const registry = new AgentRegistry()
@@ -117,22 +122,15 @@ async function main(): Promise<void> {
   }, 10 * 60_000)
   if (summaryInterval.unref) summaryInterval.unref()
 
-  // Daily knowledge extraction at 3:00 AM
-  const knowledgeInterval = setInterval(async () => {
-    if (!cheapLLM) return
-    const now = new Date()
-    if (now.getHours() !== 3 || now.getMinutes() !== 0) return
-    try {
-      const yesterday = new Date(now.getTime() - 86400000).toISOString().slice(0, 10)
-      const result = await extractDailyKnowledge(sessionStore, kg, cheapLLM, yesterday)
-      if (result.entities > 0 || result.facts > 0) {
-        log(`Knowledge extraction: ${result.entities} entities, ${result.facts} facts, ${result.relations} relations`)
-      }
-    } catch (err) {
-      log(`Knowledge extraction error: ${(err as Error).message}`)
-    }
-  }, 60_000)
-  if (knowledgeInterval.unref) knowledgeInterval.unref()
+  // Register built-in task handler: daily knowledge extraction
+  executor.registerBuiltin('builtin:daily-knowledge', async (_task, _signal) => {
+    if (!cheapLLM) return 'Skipped: no LLM configured'
+    const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10)
+    const result = await extractDailyKnowledge(sessionStore, kg, cheapLLM, yesterday)
+    const summary = `Extracted ${result.entities} entities, ${result.facts} facts, ${result.relations} relations from ${yesterday}`
+    log(`Knowledge extraction: ${summary}`)
+    return summary
+  })
 
   // 12. Main loop
   const tickInterval = setInterval(() => engine.tick(), 60_000)
@@ -146,7 +144,6 @@ async function main(): Promise<void> {
     log(`${signal} received, shutting down...`)
     clearInterval(tickInterval)
     clearInterval(summaryInterval)
-    clearInterval(knowledgeInterval)
     await executor.waitForAll(30_000)
     await ipc.stop()
     health.cleanup()

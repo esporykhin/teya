@@ -1,166 +1,112 @@
-/**
- * @description Auto-generates CRUD tools from data schema (create/list/get/update/delete/count)
- */
-import type { AgentDataStore } from './store.js'
-import type { DataSchema, TableSchema, ColumnSchema } from './schema.js'
+import type { DataStore } from './data-store.js'
 
-type DataTool = {
-  name: string
-  description: string
-  parameters: Record<string, unknown>
-  source: 'data'
-  cost: {
-    latency: 'instant' | 'fast' | 'slow'
-    tokenCost: 'none' | 'low' | 'high'
-    sideEffects: boolean
-    reversible: boolean
-    external: boolean
-  }
-  execute: (args: Record<string, unknown>) => Promise<string>
-}
+export function createDataTools(store: DataStore) {
+  const dataTool = {
+    name: 'core:data',
+    description: `Dynamic SQLite database. Create tables, store and query structured data.
 
-export function createDataTools(store: AgentDataStore, schema: DataSchema, namespace: string = 'default'): DataTool[] {
-  const tools: DataTool[] = []
-
-  // Meta-tool: always available
-  tools.push({
-    name: 'data:list_tables',
-    description: 'List all available data tables with descriptions and record counts.',
-    parameters: { type: 'object', properties: {} },
-    source: 'data',
-    cost: { latency: 'instant', tokenCost: 'low', sideEffects: false, reversible: true, external: false },
-    execute: async () => {
-      const tables = store.listTables()
-      return tables.map(t => `- ${namespace}.${t.name}: ${t.description} (${t.count} records)`).join('\n') || 'No tables defined.'
-    },
-  })
-
-  // CRUD tools per table
-  for (const [tableName, tableDef] of Object.entries(schema.tables)) {
-    const toolPrefix = `data:${namespace}.${tableName}`
-    const colDescriptions = Object.entries(tableDef.columns)
-      .map(([name, col]) => `${name} (${col.type}${col.required ? ', required' : ''})`)
-      .join(', ')
-
-    // CREATE
-    tools.push({
-      name: `${toolPrefix}:create`,
-      description: `Create a new ${tableName} record. Columns: ${colDescriptions}`,
-      parameters: buildCreateParams(tableDef),
-      source: 'data',
-      cost: { latency: 'instant', tokenCost: 'none', sideEffects: true, reversible: true, external: false },
-      execute: async (args) => {
-        const record = store.create(tableName, args)
-        return `Created ${tableName} #${record['id']}: ${JSON.stringify(record)}`
-      },
-    })
-
-    // LIST
-    tools.push({
-      name: `${toolPrefix}:list`,
-      description: `Search/list ${tableName} records. Filter, sort, paginate.`,
-      parameters: {
-        type: 'object',
-        properties: {
-          where: { type: 'object', description: 'Filters: { field: value } or { field: { op: value } }. Ops: eq, ne, gt, gte, lt, lte, like' },
-          order_by: { type: 'string', description: 'Sort field. Prefix - for DESC. e.g. "-created_at"' },
-          limit: { type: 'number', description: 'Max results (default 20, max 100)' },
-          offset: { type: 'number', description: 'Skip N results' },
+Actions:
+  create_table — define a new table with custom schema (columns, types, constraints, indexes)
+  insert       — add a row to a table
+  upsert       — insert or update based on match columns
+  update       — update rows by id or filter
+  delete       — delete rows by id or filter
+  list         — query rows with optional filters, sorting, pagination
+  get          — fetch a single row by id
+  count        — count rows optionally filtered
+  schema       — discover tables and their structure
+  alter_table  — add columns to existing table
+  drop_table   — delete a table (owner only)
+  grant        — share table access with another namespace
+  transfer     — transfer table ownership
+  sql          — run raw SELECT for complex queries (JOINs, aggregations)`,
+    parameters: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['create_table', 'insert', 'upsert', 'update', 'delete', 'list', 'get', 'count', 'schema', 'alter_table', 'drop_table', 'grant', 'transfer', 'sql'],
+          description: 'Action to perform',
         },
+        table: { type: 'string', description: 'Table name (all actions except schema without table, sql)' },
+        description: { type: 'string', description: 'Table description (create_table)' },
+        columns: {
+          type: 'array',
+          description: 'Column definitions (create_table)',
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string' },
+              type: { type: 'string', enum: ['text', 'integer', 'real', 'boolean', 'datetime', 'json'] },
+              not_null: { type: 'boolean' },
+              unique: { type: 'boolean' },
+              default: {},
+              primary_key: { type: 'boolean' },
+              references: { type: 'string', description: 'e.g. other_table(id)' },
+            },
+            required: ['name', 'type'],
+          },
+        },
+        indexes: {
+          type: 'array',
+          description: 'Index definitions (create_table)',
+          items: {
+            type: 'object',
+            properties: {
+              columns: { type: 'array', items: { type: 'string' } },
+              unique: { type: 'boolean' },
+            },
+            required: ['columns'],
+          },
+        },
+        data: { type: 'object', description: 'Row data (insert, upsert, update)' },
+        match_on: { type: 'array', items: { type: 'string' }, description: 'Columns to match for upsert' },
+        id: { type: 'number', description: 'Row id (get, update, delete)' },
+        where: { type: 'object', description: 'Filter conditions { field: value } (list, count, update, delete)' },
+        order_by: { type: 'string', description: 'Sort field, prefix - for DESC (list)' },
+        limit: { type: 'number', description: 'Max rows 1-200 (list, default 50)' },
+        offset: { type: 'number', description: 'Skip N rows (list)' },
+        add_columns: { type: 'array', description: 'New columns to add (alter_table)', items: { type: 'object' } },
+        namespace: { type: 'string', description: 'Target namespace (grant, transfer)' },
+        new_owner: { type: 'string', description: 'New owner namespace (transfer)' },
+        access: { type: 'string', enum: ['read', 'write', 'none'], description: 'Access level (grant)' },
+        query: { type: 'string', description: 'SELECT query (sql)' },
       },
-      source: 'data',
-      cost: { latency: 'instant', tokenCost: 'low', sideEffects: false, reversible: true, external: false },
-      execute: async (args) => {
-        const rows = store.list(tableName, args as { where?: Record<string, unknown>; order_by?: string; limit?: number; offset?: number })
-        if (rows.length === 0) return `No ${tableName} records found.`
-        return rows.map(r => JSON.stringify(r)).join('\n')
-      },
-    })
-
-    // GET
-    tools.push({
-      name: `${toolPrefix}:get`,
-      description: `Get a single ${tableName} record by ID.`,
-      parameters: { type: 'object', properties: { id: { type: 'number', description: 'Record ID' } }, required: ['id'] },
-      source: 'data',
-      cost: { latency: 'instant', tokenCost: 'none', sideEffects: false, reversible: true, external: false },
-      execute: async (args) => {
-        const record = store.get(tableName, args['id'] as number)
-        return record ? JSON.stringify(record) : `${tableName} #${args['id']} not found.`
-      },
-    })
-
-    // UPDATE
-    tools.push({
-      name: `${toolPrefix}:update`,
-      description: `Update a ${tableName} record. Pass id and fields to change.`,
-      parameters: buildUpdateParams(tableDef),
-      source: 'data',
-      cost: { latency: 'instant', tokenCost: 'none', sideEffects: true, reversible: true, external: false },
-      execute: async (args) => {
-        const { id, ...data } = args
-        const record = store.update(tableName, id as number, data)
-        return record ? `Updated ${tableName} #${id}: ${JSON.stringify(record)}` : `${tableName} #${id} not found.`
-      },
-    })
-
-    // DELETE
-    tools.push({
-      name: `${toolPrefix}:delete`,
-      description: `Delete a ${tableName} record by ID.`,
-      parameters: { type: 'object', properties: { id: { type: 'number', description: 'Record ID' } }, required: ['id'] },
-      source: 'data',
-      cost: { latency: 'instant', tokenCost: 'none', sideEffects: true, reversible: false, external: false },
-      execute: async (args) => {
-        return store.delete(tableName, args['id'] as number)
-          ? `Deleted ${tableName} #${args['id']}`
-          : `${tableName} #${args['id']} not found.`
-      },
-    })
-
-    // COUNT
-    tools.push({
-      name: `${toolPrefix}:count`,
-      description: `Count ${tableName} records, optionally filtered.`,
-      parameters: { type: 'object', properties: { where: { type: 'object', description: 'Filters' } } },
-      source: 'data',
-      cost: { latency: 'instant', tokenCost: 'none', sideEffects: false, reversible: true, external: false },
-      execute: async (args) => {
-        const count = store.count(tableName, args['where'] as Record<string, unknown> | undefined)
-        return `${count} ${tableName} records${args['where'] ? ' matching filter' : ''}`
-      },
-    })
+      required: ['action'],
+    },
+    source: 'builtin' as const,
+    cost: {
+      latency: 'instant' as const,
+      tokenCost: 'low' as const,
+      sideEffects: true,
+      reversible: true,
+      external: false,
+    },
+    execute: async (args: Record<string, unknown>): Promise<string> => {
+      try {
+        const action = args.action as string
+        switch (action) {
+          case 'create_table': return store.createTable(args)
+          case 'insert': return store.insert(args)
+          case 'upsert': return store.upsert(args)
+          case 'update': return store.update(args)
+          case 'delete': return store.delete(args)
+          case 'list': return store.list(args)
+          case 'get': return store.get(args)
+          case 'count': return store.count(args)
+          case 'schema': return store.schema(args)
+          case 'alter_table': return store.alterTable(args)
+          case 'drop_table': return store.dropTable(args)
+          case 'grant': return store.grant(args)
+          case 'transfer': return store.transfer(args)
+          case 'sql': return store.sql(args)
+          default: return `Unknown action: ${action}. Available: create_table, insert, upsert, update, delete, list, get, count, schema, alter_table, drop_table, grant, transfer, sql`
+        }
+      } catch (err) {
+        return `Error: ${err instanceof Error ? err.message : String(err)}`
+      }
+    },
   }
 
-  return tools
-}
-
-function buildCreateParams(def: TableSchema): Record<string, unknown> {
-  const properties: Record<string, unknown> = {}
-  const required: string[] = []
-  for (const [name, col] of Object.entries(def.columns)) {
-    const prop: Record<string, unknown> = { type: jsonSchemaType(col), description: col.description || name }
-    if (col.values) prop['enum'] = col.values
-    properties[name] = prop
-    if (col.required) required.push(name)
-  }
-  return { type: 'object', properties, required }
-}
-
-function buildUpdateParams(def: TableSchema): Record<string, unknown> {
-  const properties: Record<string, unknown> = { id: { type: 'number', description: 'Record ID' } }
-  for (const [name, col] of Object.entries(def.columns)) {
-    properties[name] = { type: jsonSchemaType(col), description: col.description || name }
-  }
-  return { type: 'object', properties, required: ['id'] }
-}
-
-function jsonSchemaType(col: ColumnSchema): string {
-  switch (col.type) {
-    case 'integer': case 'relation': return 'number'
-    case 'number': return 'number'
-    case 'boolean': return 'boolean'
-    case 'json': return 'object'
-    default: return 'string'
-  }
+  return { dataTool }
 }

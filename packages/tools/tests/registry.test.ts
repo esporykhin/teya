@@ -7,8 +7,7 @@ describe('Tool Registry', () => {
     registerBuiltins(registry)
 
     expect(registry.listNames()).toContain('core:think')
-    expect(registry.listNames()).toContain('core:web_fetch')
-    expect(registry.listNames()).toContain('core:web_search')
+    expect(registry.listNames()).toContain('core:web')
     expect(registry.listNames()).toContain('core:plan')
     expect(registry.get('core:think')).toBeDefined()
   })

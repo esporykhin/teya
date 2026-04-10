@@ -99,35 +99,48 @@ export async function batchSummarize(
 
 // ── Daily Knowledge Extraction ───────────────────────────────────────────────
 
-const EXTRACTION_PROMPT = `You are a knowledge extraction system. Analyze the user's conversations from today and extract structured knowledge.
+const EXTRACTION_PROMPT = `You are a knowledge extraction system. Analyze conversations and extract structured, self-contained knowledge.
 
-Extract these types of information:
-1. **User preferences** — how they like to work, what tools they prefer, communication style
-2. **Project facts** — decisions made, architecture choices, technologies used
-3. **People/entities** — projects, tools, services, people mentioned
-4. **Patterns** — recurring themes, common requests, workflow habits
-5. **Decisions** — important choices made and their reasoning
+Extract:
+1. User preferences — how they work, tools they prefer, communication style
+2. Project facts — decisions, architecture, technologies, deployment details
+3. People/entities — projects, tools, services, people and their roles
+4. Decisions — choices made with their reasoning
 
-Respond ONLY in this JSON format:
+CRITICAL — each fact must be SELF-CONTAINED and ATOMIC:
+
+BAD (useless later):
+  entity: "Evgeny", fact: "Boss, stack, philosophy"
+  entity: "Redis", fact: "decided to use it"
+  entity: "Loocl", fact: "uses TypeScript"
+
+GOOD (useful later):
+  entity: "Evgeny Sporykhin", fact: "Solo developer, owns all projects, makes final decisions"
+  entity: "Speeqa", fact: "Uses Redis for BullMQ job queues because PostgreSQL-based queues had lock contention"
+  entity: "Loocl Backend", fact: "Built on FastAPI with PostgreSQL, deployed on server 83.222.27.224"
+
+Respond ONLY in JSON:
 {
   "entities": [
-    {"name": "entity name", "type": "person|project|tool|service|concept", "description": "brief description"}
+    {"name": "EntityName", "type": "person|project|tool|service|concept", "description": "one-line description of WHAT this entity IS"}
   ],
   "facts": [
-    {"entity": "entity name", "content": "the fact or observation", "tags": ["tag1", "tag2"]}
+    {"entity": "EntityName", "content": "self-contained atomic fact with subject and context", "tags": ["tag1"]}
   ],
   "relations": [
-    {"from": "entity A", "to": "entity B", "type": "uses|works_on|prefers|decided|created"}
+    {"from": "entity A", "to": "entity B", "type": "uses|owns|works_on|prefers|decided|created"}
   ]
 }
 
 Rules:
-- Extract only NON-OBVIOUS information (don't state that "user uses a computer")
-- Facts should be specific and actionable
-- Use the language of the conversations
-- Focus on things useful for future interactions
-- Deduplicate — if same fact appears in multiple sessions, mention once
-- Max 20 entities, 30 facts, 15 relations per extraction`
+- Only NON-OBVIOUS information
+- Each fact must be readable and useful WITHOUT the original conversation
+- One fact = one piece of information, never comma-separated lists
+- Entity descriptions are mandatory — explain WHAT the entity is
+- Always create relations between entities
+- Use conversation language
+- Deduplicate across sessions
+- Max 20 entities, 30 facts, 15 relations`
 
 /**
  * Extract knowledge from today's sessions and write to knowledge graph.

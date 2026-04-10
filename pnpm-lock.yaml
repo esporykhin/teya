@@ -20,6 +20,9 @@ importers:
       '@teya/core':
         specifier: workspace:*
         version: link:../core
+      '@teya/data':
+        specifier: workspace:*
+        version: link:../data
       '@teya/eval':
         specifier: workspace:*
         version: link:../eval
@@ -154,6 +157,9 @@ importers:
       '@teya/core':
         specifier: workspace:*
         version: link:../core
+      '@teya/data':
+        specifier: workspace:*
+        version: link:../data
       '@teya/providers':
         specifier: workspace:*
         version: link:../providers

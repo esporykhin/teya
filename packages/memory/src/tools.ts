@@ -14,13 +14,29 @@ import type { KnowledgeGraph } from './knowledge.js'
 export function createMemoryTools(kg: KnowledgeGraph) {
   const memoryTool = {
     name: 'core:memory',
-    description: `Long-term memory. Actions:
-  read    — look up an entity's facts and relations
-  write   — save a fact about an entity (auto-dedup)
-  search  — find facts by keyword or semantic query
+    description: `Long-term memory — your persistent knowledge graph.
+
+Actions:
+  read     — look up an entity's facts and relations
+  write    — save a fact about an entity (auto-dedup)
+  search   — find facts by keyword or semantic query
   entities — list all known entities
-  relate  — link two entities
-  update  — replace an outdated fact`,
+  relate   — link two entities
+  update   — replace an outdated fact
+
+How to write good facts — EVERY fact must be SELF-CONTAINED (understandable without conversation context):
+
+BAD:  entity="Evgeny", fact="Boss, stack, philosophy Tiny Empire"
+BAD:  entity="Loocl", fact="uses TypeScript"
+GOOD: entity="Evgeny Sporykhin", fact="Solo developer building AI products at MPSTATS and personal projects (Loocl, Qreata)"
+GOOD: entity="Loocl", fact="Backend built on FastAPI with PostgreSQL and Redis for BullMQ job queues"
+
+Rules:
+1. One fact = one atomic piece of information
+2. Fact must include subject and context — readable by any agent 6 months later
+3. Never concatenate multiple facts with commas — call write multiple times
+4. Use relate to connect entities (Evgeny -> owns -> Loocl)
+5. Write in the language the user speaks`,
     parameters: {
       type: 'object',
       properties: {
@@ -34,7 +50,7 @@ export function createMemoryTools(kg: KnowledgeGraph) {
         // For write
         entity_name: { type: 'string', description: 'Entity name (write/read/relate)' },
         entity_type: { type: 'string', description: 'Entity type: person, project, company, concept, preference (write)' },
-        fact: { type: 'string', description: 'Fact to save (write) or new fact (update)' },
+        fact: { type: 'string', description: 'A single self-contained fact. Must be understandable without conversation context. Include subject and context.' },
         tags: { type: 'array', items: { type: 'string' }, description: 'Tags (write)' },
         // For relate
         from: { type: 'string', description: 'Source entity name (relate)' },

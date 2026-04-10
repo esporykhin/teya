@@ -21,8 +21,12 @@ export interface DaemonExecutorConfig {
   apiKey: string
 }
 
+/** Handler for a built-in task — receives the task and returns a result string */
+export type BuiltinHandler = (task: Task, signal: AbortSignal) => Promise<string>
+
 export class DaemonExecutor implements CronEngineExecutor {
   private activeExecutions = new Map<string, Promise<void>>()
+  private builtinHandlers = new Map<string, BuiltinHandler>()
 
   constructor(
     private config: DaemonExecutorConfig,
@@ -33,6 +37,11 @@ export class DaemonExecutor implements CronEngineExecutor {
     private onComplete?: (task: Task, result: string) => void,
     private onError?: (task: Task, error: Error) => void,
   ) {}
+
+  /** Register a handler for a "builtin:<name>" prompt. */
+  registerBuiltin(handler: string, fn: BuiltinHandler): void {
+    this.builtinHandlers.set(handler, fn)
+  }
 
   async execute(task: Task, signal: AbortSignal): Promise<void> {
     const execId = randomUUID().slice(0, 12)
@@ -74,6 +83,30 @@ export class DaemonExecutor implements CronEngineExecutor {
     let totalOutputTokens = 0
 
     try {
+      // 0. Built-in handler shortcut — no LLM session needed
+      const builtinKey = task.prompt?.startsWith('builtin:') ? task.prompt : undefined
+      if (builtinKey) {
+        const handler = this.builtinHandlers.get(builtinKey)
+        if (handler) {
+          result = await handler(task, signal)
+          this.store.updateExecution(execId, {
+            status: 'completed',
+            finishedAt: new Date().toISOString(),
+            result: result.slice(0, 5000),
+          })
+          if (task.cron) {
+            this.store.markRun(task.id, result.slice(0, 2000))
+            this.store.update(task.id, { status: 'pending', retryCount: 0 })
+          } else {
+            this.store.update(task.id, { status: 'completed', result: result.slice(0, 2000) })
+          }
+          this.onComplete?.(task, result)
+          return
+        }
+        // Unknown builtin — fail fast instead of running as LLM prompt
+        throw new Error(`No handler registered for builtin task: ${builtinKey}`)
+      }
+
       // 1. Resolve agent
       const agentDef = task.assignee ? this.registry.get(task.assignee) : undefined
 

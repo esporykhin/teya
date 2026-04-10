@@ -17,7 +17,8 @@
     "@teya/core": "workspace:*",
     "@teya/tools": "workspace:*",
     "@teya/providers": "workspace:*",
-    "@teya/tracing": "workspace:*"
+    "@teya/tracing": "workspace:*",
+    "@teya/data": "workspace:*"
   },
   "devDependencies": {
     "tsup": "^8.0.0",
