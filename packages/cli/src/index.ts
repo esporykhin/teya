@@ -9,7 +9,7 @@ import { join } from 'path'
 import { agentLoop, buildSystemPrompt } from '@teya/core'
 import { loadSkills, buildSkillsMetadata, buildActiveSkillContent } from '@teya/skills'
 import type { Message, LLMProvider } from '@teya/core'
-import { openrouter, ollama, withToolAdapter } from '@teya/providers'
+import { openrouter, ollama, codex, withToolAdapter, fallback } from '@teya/providers'
 import { createToolRegistry, registerBuiltins, createMCPManager, createDynamicToolLoader, closeBrowser, initWorkspace, getWorkspaceInfo } from '@teya/tools'
 import { AgentRegistry, createDelegateTool } from '@teya/orchestrator'
 import { CLITransport } from '@teya/transport-cli'
@@ -56,23 +56,26 @@ async function interactiveSetup(): Promise<{ provider: string; model: string; ap
   console.log('  1. OpenRouter (recommended — access to all models with one API key)')
   console.log('     Get your key at: https://openrouter.ai/keys')
   console.log('  2. Ollama (local models, no API key required)')
-  console.log('     Install at: https://ollama.com\n')
+  console.log('     Install at: https://ollama.com')
+  console.log('  3. Codex (OpenAI Codex CLI — runs as subprocess)')
+  console.log('     Install: npm i -g @openai/codex\n')
 
-  const providerChoice = await ask(rl, 'Provider (1 or 2)', '1')
+  const providerChoice = await ask(rl, 'Provider (1, 2, or 3)', '1')
   const isOllama = providerChoice.trim() === '2'
+  const isCodex = providerChoice.trim() === '3'
 
-  const provider = isOllama ? 'ollama' : 'openrouter'
-  const defaultModel = isOllama ? 'qwen3:8b' : 'google/gemini-2.0-flash-001'
-  const model = await ask(rl, 'Model', defaultModel)
+  const provider = isCodex ? 'codex' : isOllama ? 'ollama' : 'openrouter'
+  const defaultModel = isCodex ? '' : isOllama ? 'qwen3:8b' : 'google/gemini-2.0-flash-001'
+  const model = await ask(rl, `Model${isCodex ? ' (empty for codex default)' : ''}`, defaultModel)
 
   let apiKey = ''
-  if (!isOllama) {
+  if (!isOllama && !isCodex) {
     apiKey = await ask(rl, 'API Key (OpenRouter)')
   }
 
   rl.close()
 
-  if (!isOllama && !apiKey) {
+  if (!isOllama && !isCodex && !apiKey) {
     console.error('\nAPI key is required. Get one at https://openrouter.ai/keys')
     process.exit(1)
   }
@@ -247,7 +250,7 @@ async function main() {
   let apiKey = args['api-key'] ?? process.env.OPENROUTER_API_KEY ?? process.env.TEYA_API_KEY ?? saved.apiKey ?? ''
 
   // If no config — interactive setup
-  if (!apiKey && providerType !== 'ollama') {
+  if (!apiKey && providerType !== 'ollama' && providerType !== 'codex') {
     const setup = await interactiveSetup()
     providerType = setup.provider
     model = setup.model
@@ -257,15 +260,31 @@ async function main() {
   if (!providerType) providerType = 'openrouter'
   if (!model) model = providerType === 'ollama' ? 'qwen3:8b' : 'google/gemini-2.0-flash-001'
 
-  // Create provider
-  let provider: LLMProvider
-  if (providerType === 'openrouter') {
-    provider = openrouter({ model, apiKey })
-  } else if (providerType === 'ollama') {
-    provider = withToolAdapter(ollama({ model, baseUrl: args['base-url'] }))
-  } else {
-    console.error(`Unknown provider: ${providerType}. Supported: openrouter, ollama`)
+  // Helper: instantiate a provider by type
+  function makeProvider(type: string, mdl: string, key: string, baseUrl?: string): LLMProvider {
+    if (type === 'openrouter') return openrouter({ model: mdl, apiKey: key })
+    if (type === 'ollama') return withToolAdapter(ollama({ model: mdl, baseUrl }))
+    if (type === 'codex') return codex({ model: mdl || undefined, cwd: process.cwd() })
+    console.error(`Unknown provider: ${type}. Supported: openrouter, ollama, codex`)
     process.exit(1)
+  }
+
+  // Create primary provider
+  let provider: LLMProvider = makeProvider(providerType, model, apiKey, args['base-url'])
+
+  // Wrap with fallback if configured
+  const fallbackType = args['fallback'] ?? process.env.TEYA_FALLBACK ?? (saved as any).fallback?.provider ?? ''
+  if (fallbackType) {
+    const fallbackModel = args['fallback-model'] ?? (saved as any).fallback?.model ?? ''
+    const fallbackKey = args['fallback-api-key'] ?? (saved as any).fallback?.apiKey ?? apiKey
+    const fb = makeProvider(fallbackType, fallbackModel, fallbackKey)
+    provider = fallback([provider, fb], {
+      retries: 1,
+      onFallback: (from, to, err) => {
+        console.log(`\x1b[33m[fallback] ${from} failed: ${err.message}\x1b[0m`)
+        console.log(`\x1b[33m[fallback] switching to ${to}\x1b[0m`)
+      },
+    })
   }
 
   // Create tracer based on --tracing flag (early, so it can be passed to delegate tool)
@@ -536,6 +555,8 @@ async function main() {
               provider = openrouter({ model, apiKey })
             } else if (providerType === 'ollama') {
               provider = withToolAdapter(ollama({ model }))
+            } else if (providerType === 'codex') {
+              provider = codex({ model: model || undefined, cwd: process.cwd() })
             }
             const saved = await loadSavedConfig()
             saved.model = model
