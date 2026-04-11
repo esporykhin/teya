@@ -12,6 +12,7 @@ import type {
   GenerateOptions,
   GenerateResponse,
   ProviderCapabilities,
+  Message,
 } from '@teya/core'
 
 // ─── Codex JSONL event types ─────────────────────────────────────────────────
@@ -64,6 +65,41 @@ type CodexEvent =
   | CodexTurnFailed
   | CodexError
 
+// ─── Conversation serializer ─────────────────────────────────────────────────
+
+function buildPromptWithContext(messages: Message[]): string {
+  // If only one user message — no context needed
+  const userMessages = messages.filter((m) => m.role === 'user')
+  if (userMessages.length <= 1) {
+    return userMessages[0]?.content ?? ''
+  }
+
+  // Serialize conversation history (skip system messages, keep last ~20 turns)
+  const relevant = messages
+    .filter((m) => m.role === 'user' || m.role === 'assistant')
+    .slice(-40) // last 20 exchanges max
+
+  const lastUserMsg = [...messages].reverse().find((m) => m.role === 'user')
+  const history = relevant.slice(0, -1) // everything except the last message
+
+  if (history.length === 0) {
+    return lastUserMsg?.content ?? ''
+  }
+
+  const contextLines = history.map((m) => {
+    const role = m.role === 'user' ? 'User' : 'Assistant'
+    // Truncate long messages in history to save tokens
+    const content = m.content.length > 500 ? m.content.slice(0, 500) + '...' : m.content
+    return `${role}: ${content}`
+  })
+
+  return `<conversation_context>
+${contextLines.join('\n')}
+</conversation_context>
+
+User: ${lastUserMsg?.content ?? ''}`
+}
+
 // ─── Provider factory ────────────────────────────────────────────────────────
 
 export function codex(config: {
@@ -95,9 +131,8 @@ export function codex(config: {
     request: GenerateRequest,
     options?: GenerateOptions,
   ): Promise<GenerateResponse> {
-    // Build the prompt from messages — take the last user message
-    const lastUserMsg = [...request.messages].reverse().find((m) => m.role === 'user')
-    const prompt = lastUserMsg?.content ?? ''
+    // Build prompt with conversation context
+    const prompt = buildPromptWithContext(request.messages)
 
     if (!prompt) {
       return {
@@ -118,8 +153,13 @@ export function codex(config: {
     // Build args
     const args: string[] = ['exec', '--json', '--skip-git-repo-check']
 
-    if (fullAuto) args.push('--full-auto')
-    else args.push('--sandbox', sandbox)
+    if (sandbox === 'danger-full-access') {
+      args.push('--dangerously-bypass-approvals-and-sandbox')
+    } else if (fullAuto) {
+      args.push('--full-auto')
+    } else {
+      args.push('--sandbox', sandbox)
+    }
 
     if (model) args.push('--model', model)
     args.push('-C', cwd)

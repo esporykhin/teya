@@ -30,7 +30,7 @@
 |------|---------|
 | **Privacy** | **Your data stays yours.** Sandboxed workspace -- the agent writes to its own directory, not yours. Run fully offline with Ollama. Zero external calls when you need it. |
 | **Permission engine** | **Defaults to safe.** Allow-all, ask-before-acting, rule-based, or deny-all modes. DLP guard blocks data exfiltration. Credentials never reach the model. |
-| **Skills** | **Add capabilities through plugins.** Manifest-driven skills with tools and prompt sections. Install from GitHub, URL, or local directory. Sandboxed execution. |
+| **Skills** | **Add capabilities through plugins.** Manifest-driven skills with tools and prompt sections. Install from GitHub, URL, local directory, or Teya's bundled verified catalog. Sandboxed execution. |
 | **Channels** | **One assistant, everywhere.** CLI with image paste and @mentions. Telegram bot. Same memory, same personality, same skills across all channels. |
 | **Any LLM** | **Swap models without changing anything.** OpenRouter (100+ models), Ollama (local), or mix them with multi-model routing. Automatic fallback chains. |
 | **Observability** | **See everything the agent does.** OTEL-compatible tracing to console, JSON files, or Jaeger/Tempo/Datadog. Every LLM call, tool execution, and delegation tracked with cost and latency. |
@@ -111,6 +111,99 @@ Create specialized agents in `~/.teya/agents/`:
 Mention them in conversation: `@researcher find the top 5 competitors in this space`
 
 The main agent sees all sub-agents and delegates automatically when the task matches.
+
+---
+
+## Skills
+
+Teya supports two skill sources:
+
+- Installed skills in `~/.teya/skills/`
+- Bundled verified skills in [`packages/skills/verified/`](packages/skills/verified/)
+
+Verified skills are the curated built-in option. They do not block installing external skills from GitHub, URL, or a local folder.
+
+Verified skills live in the repository as regular Claude-style skill folders:
+
+```text
+packages/skills/verified/
+  digest/
+    SKILL.md
+    tables.md
+    templates/
+      digest-outline.md
+  market-research/
+    SKILL.md
+  sales-pipeline/
+    SKILL.md
+    tables.md
+    templates/
+      pipeline-review.md
+  personal-stylist/
+    SKILL.md
+    templates/
+      wardrobe-plan.md
+  nutrition-coach/
+    SKILL.md
+    tables.md
+    templates/
+      nutrition-plan.md
+```
+
+Each skill is a full folder, not a single markdown file. It can ship prompt instructions, templates, scripts, helper docs, and assets in one installable unit.
+
+Recommended frontmatter for a verified skill:
+
+```yaml
+---
+name: digest
+description: Build recurring digests from structured sources.
+category: content
+audience: both
+domains: ["content", "research", "operations"]
+triggers: ["digest", "newsletter"]
+tags: ["content", "sources", "tables"]
+inputs: ["goal", "sources", "audience"]
+outputs: ["source registry", "digest"]
+order: 10
+---
+```
+
+Recommended taxonomy for a larger catalog:
+
+- Keep one folder per skill. A skill can include `SKILL.md`, `scripts/`, `templates/`, `assets/`, and helper docs.
+- Use `audience` for `business` / `personal` / `both`.
+- Use `category` as a compact library bucket like `content`, `research`, `finance`, `style`, `health`.
+- Use `domains` for stable topical grouping like `marketing`, `operations`, `wellbeing`, `career`, `sales`.
+- Use `tags` for looser discovery terms and UI search, not as the primary taxonomy.
+
+List the curated catalog:
+
+```bash
+teya skill verified
+```
+
+Install a verified skill:
+
+```bash
+teya skill add verified:market-research
+```
+
+Current verified catalog:
+
+| Skill | Audience | Category | What it does |
+|------|----------|----------|--------------|
+| `digest` | `both` | `content` | Builds recurring or one-off digests from structured sources and keeps the source registry in Teya tables. |
+| `market-research` | `business` | `research` | Analyzes markets, competitors, pricing, and demand signals before a product or growth decision. |
+| `sales-pipeline` | `business` | `sales` | Creates and maintains a lightweight sales pipeline in Teya tables, including next actions and review cadence. |
+| `personal-stylist` | `personal` | `style` | Turns goals, wardrobe constraints, and context into a practical style direction and outfit plan. |
+| `nutrition-coach` | `personal` | `health` | Builds a sustainable nutrition routine and, when useful, keeps goals and check-ins in Teya tables. |
+
+Catalog shape:
+
+- `business`: tools like research, sales, operations, finance, content workflows.
+- `personal`: tools like style, nutrition, wellbeing, routines, learning.
+- `both`: reusable workflows that work for either side, like `digest`.
 
 ---
 

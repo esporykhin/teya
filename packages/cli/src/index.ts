@@ -7,7 +7,7 @@ import * as readline from 'readline'
 import { readFile, writeFile, mkdir } from 'fs/promises'
 import { join } from 'path'
 import { agentLoop, buildSystemPrompt } from '@teya/core'
-import { loadSkills, buildSkillsMetadata, buildActiveSkillContent } from '@teya/skills'
+import { loadSkills, buildSkillsMetadata, buildActiveSkillContent, buildVerifiedSkillsCatalog } from '@teya/skills'
 import type { Message, LLMProvider } from '@teya/core'
 import { openrouter, ollama, codex, withToolAdapter, fallback } from '@teya/providers'
 import { createToolRegistry, registerBuiltins, createMCPManager, createDynamicToolLoader, closeBrowser, initWorkspace, getWorkspaceInfo } from '@teya/tools'
@@ -129,6 +129,27 @@ if (subcommand === 'skill') {
     process.exit(0)
   }
 
+  if (action === 'verified') {
+    const { listVerifiedSkills } = await import('@teya/skills')
+    const skills = await listVerifiedSkills()
+    if (skills.length === 0) {
+      console.log('No verified skills available.')
+    } else {
+      console.log('Verified skills:')
+      for (const s of skills) {
+        const skill = s as typeof s & { audience?: string; domains?: string[] }
+        const meta: string[] = []
+        if (skill.category) meta.push(`category: ${skill.category}`)
+        if (skill.audience) meta.push(`audience: ${skill.audience}`)
+        if (skill.domains && skill.domains.length > 0) meta.push(`domains: ${skill.domains.join(', ')}`)
+        if (skill.tags.length > 0) meta.push(`tags: ${skill.tags.join(', ')}`)
+        console.log(`  ${skill.slug} — ${skill.description}${meta.length > 0 ? ` [${meta.join(' | ')}]` : ''}`)
+      }
+      console.log('\nInstall with: teya skill add verified:<name>')
+    }
+    process.exit(0)
+  }
+
   if (action === 'remove' && target) {
     const { removeSkill } = await import('@teya/skills')
     if (removeSkill(target)) {
@@ -140,8 +161,9 @@ if (subcommand === 'skill') {
   }
 
   console.log('Usage:')
-  console.log('  teya skill add <source>    Install a skill (github:user/repo, URL, or local path)')
+  console.log('  teya skill add <source>    Install a skill (verified:<name>, github:user/repo, URL, or local path)')
   console.log('  teya skill list            List installed skills')
+  console.log('  teya skill verified        List curated verified skills bundled with Teya')
   console.log('  teya skill remove <name>   Remove a skill')
   process.exit(0)
 }
@@ -260,11 +282,15 @@ async function main() {
   if (!providerType) providerType = 'openrouter'
   if (!model) model = providerType === 'ollama' ? 'qwen3:8b' : 'google/gemini-2.0-flash-001'
 
+  // Codex sandbox mode from config/CLI/env
+  const codexSandbox = (args['codex-sandbox'] ?? process.env.CODEX_SANDBOX ?? (saved as any).codex?.sandbox ?? 'workspace-write') as 'read-only' | 'workspace-write' | 'danger-full-access'
+  const codexFullAuto = codexSandbox !== 'danger-full-access'
+
   // Helper: instantiate a provider by type
   function makeProvider(type: string, mdl: string, key: string, baseUrl?: string): LLMProvider {
     if (type === 'openrouter') return openrouter({ model: mdl, apiKey: key })
     if (type === 'ollama') return withToolAdapter(ollama({ model: mdl, baseUrl }))
-    if (type === 'codex') return codex({ model: mdl || undefined, cwd: process.cwd() })
+    if (type === 'codex') return codex({ model: mdl || undefined, cwd: process.cwd(), sandbox: codexSandbox, fullAuto: codexFullAuto })
     console.error(`Unknown provider: ${type}. Supported: openrouter, ollama, codex`)
     process.exit(1)
   }
@@ -388,11 +414,12 @@ async function main() {
   const activeSkillContent = allSkills.length > 0 && allSkills.length < 5
     ? buildActiveSkillContent(allSkills)
     : ''
+  const verifiedSkillsCatalog = await buildVerifiedSkillsCatalog()
 
   // Build system prompt (reads SOUL.md / AGENTS.md from cwd if present)
   const systemPrompt = await buildSystemPrompt({
     agentDir: process.cwd(),
-    skillsMetadata: skillsMetadata || undefined,
+    skillsMetadata: [skillsMetadata, verifiedSkillsCatalog].filter(Boolean).join('\n\n') || undefined,
     activeSkillContent: activeSkillContent || undefined,
   }) + '\n\n' + getWorkspaceInfo()
 

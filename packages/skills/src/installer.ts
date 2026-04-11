@@ -4,11 +4,21 @@
 import { execSync } from 'child_process'
 import { existsSync, mkdirSync, cpSync, rmSync, readdirSync } from 'fs'
 import { join, basename } from 'path'
+import { getVerifiedSkillSourceDir } from './verified.js'
 
-const SKILLS_DIR = join(process.env.HOME || '.', '.teya', 'skills')
+function getInstalledSkillsDir(): string {
+  return join(process.env.HOME || '.', '.teya', 'skills')
+}
 
 export async function installSkill(source: string): Promise<{ name: string; path: string }> {
-  mkdirSync(SKILLS_DIR, { recursive: true })
+  const skillsDir = getInstalledSkillsDir()
+  mkdirSync(skillsDir, { recursive: true })
+
+  if (source.startsWith('verified:')) {
+    const name = source.slice('verified:'.length).trim()
+    if (!name) throw new Error('Verified skill format: verified:<name>')
+    return installVerifiedSkill(name)
+  }
 
   // GitHub: teya skill add github:user/repo
   // or: teya skill add github:user/repo/path/to/skill
@@ -30,6 +40,7 @@ export async function installSkill(source: string): Promise<{ name: string; path
 }
 
 async function installFromGitHub(spec: string): Promise<{ name: string; path: string }> {
+  const skillsDir = getInstalledSkillsDir()
   // spec: "user/repo" or "user/repo/path/to/skill"
   const parts = spec.split('/')
   if (parts.length < 2) throw new Error('GitHub format: github:user/repo or github:user/repo/path')
@@ -39,7 +50,7 @@ async function installFromGitHub(spec: string): Promise<{ name: string; path: st
   const subPath = parts.slice(2).join('/')
 
   // Clone to temp dir
-  const tmpDir = join(SKILLS_DIR, '.tmp-' + Date.now())
+  const tmpDir = join(skillsDir, '.tmp-' + Date.now())
   try {
     execSync(`git clone --depth 1 https://github.com/${user}/${repo}.git "${tmpDir}"`, { stdio: 'pipe' })
 
@@ -55,12 +66,12 @@ async function installFromGitHub(spec: string): Promise<{ name: string; path: st
         const installed: string[] = []
         for (const dir of skillDirs) {
           const skillName = dir.name
-          const targetDir = join(SKILLS_DIR, skillName)
+          const targetDir = join(skillsDir, skillName)
           if (existsSync(targetDir)) rmSync(targetDir, { recursive: true })
           cpSync(join(sourceDir, skillName), targetDir, { recursive: true })
           installed.push(skillName)
         }
-        return { name: installed.join(', '), path: SKILLS_DIR }
+        return { name: installed.join(', '), path: skillsDir }
       }
 
       throw new Error(`No SKILL.md found in ${spec}`)
@@ -68,7 +79,7 @@ async function installFromGitHub(spec: string): Promise<{ name: string; path: st
 
     // Single skill
     const skillName = subPath ? basename(subPath) : repo
-    const targetDir = join(SKILLS_DIR, skillName)
+    const targetDir = join(skillsDir, skillName)
     if (existsSync(targetDir)) rmSync(targetDir, { recursive: true })
     cpSync(sourceDir, targetDir, { recursive: true })
 
@@ -94,29 +105,36 @@ async function installFromGitHubUrl(url: string): Promise<{ name: string; path: 
   return installFromGitHub(`${user}/${repo}${subPath ? '/' + subPath : ''}`)
 }
 
-async function installFromLocal(source: string): Promise<{ name: string; path: string }> {
+async function installFromLocal(source: string, targetName?: string): Promise<{ name: string; path: string }> {
+  const skillsDir = getInstalledSkillsDir()
   if (!existsSync(join(source, 'SKILL.md'))) {
     throw new Error(`No SKILL.md found in ${source}`)
   }
 
-  const skillName = basename(source)
-  const targetDir = join(SKILLS_DIR, skillName)
+  const skillName = targetName || basename(source)
+  const targetDir = join(skillsDir, skillName)
   if (existsSync(targetDir)) rmSync(targetDir, { recursive: true })
   cpSync(source, targetDir, { recursive: true })
 
   return { name: skillName, path: targetDir }
 }
 
+export async function installVerifiedSkill(name: string): Promise<{ name: string; path: string }> {
+  const sourceDir = getVerifiedSkillSourceDir(name)
+  return installFromLocal(sourceDir, name)
+}
+
 export function listInstalledSkills(): Array<{ name: string; path: string }> {
-  mkdirSync(SKILLS_DIR, { recursive: true })
-  const entries = readdirSync(SKILLS_DIR, { withFileTypes: true })
+  const skillsDir = getInstalledSkillsDir()
+  mkdirSync(skillsDir, { recursive: true })
+  const entries = readdirSync(skillsDir, { withFileTypes: true })
   return entries
     .filter(e => e.isDirectory() && !e.name.startsWith('.'))
-    .map(e => ({ name: e.name, path: join(SKILLS_DIR, e.name) }))
+    .map(e => ({ name: e.name, path: join(skillsDir, e.name) }))
 }
 
 export function removeSkill(name: string): boolean {
-  const targetDir = join(SKILLS_DIR, name)
+  const targetDir = join(getInstalledSkillsDir(), name)
   if (!existsSync(targetDir)) return false
   rmSync(targetDir, { recursive: true })
   return true

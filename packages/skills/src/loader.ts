@@ -8,8 +8,38 @@ export interface Skill {
   name: string
   description: string
   triggers: string[]
+  tags: string[]
+  category?: string
+  audience?: string
+  domains: string[]
+  inputs: string[]
+  outputs: string[]
+  order: number
   body: string
   dir: string
+}
+
+function parseScalar(raw: string): unknown {
+  const value = raw.trim()
+  if (!value) return ''
+  if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith('\'') && value.endsWith('\''))) {
+    return value.slice(1, -1)
+  }
+  if (value === 'true') return true
+  if (value === 'false') return false
+  if (/^-?\d+(\.\d+)?$/.test(value)) return Number(value)
+  return value
+}
+
+function parseArray(raw: string): unknown {
+  const normalized = raw.replace(/'/g, '"')
+  try {
+    return JSON.parse(normalized)
+  } catch {
+    const inner = raw.slice(1, -1).trim()
+    if (!inner) return []
+    return inner.split(',').map(item => String(parseScalar(item.trim())))
+  }
 }
 
 // Parse YAML-like frontmatter from SKILL.md
@@ -23,14 +53,19 @@ function parseFrontmatter(content: string): { frontmatter: Record<string, unknow
     if (colonIdx > 0) {
       const key = line.slice(0, colonIdx).trim()
       let value: unknown = line.slice(colonIdx + 1).trim()
-      // Handle YAML arrays like: triggers: ["book", "reserve"]
-      if (typeof value === 'string' && value.startsWith('[')) {
-        try { value = JSON.parse(value.replace(/'/g, '"')) } catch { /* keep as string */ }
+      if (typeof value === 'string' && value.startsWith('[') && value.endsWith(']')) {
+        value = parseArray(value)
+      } else if (typeof value === 'string') {
+        value = parseScalar(value)
       }
       fm[key] = value
     }
   }
   return { frontmatter: fm, body: match[2].trim() }
+}
+
+function toStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
 }
 
 export async function loadSkills(skillsDir: string): Promise<Skill[]> {
@@ -51,7 +86,14 @@ export async function loadSkills(skillsDir: string): Promise<Skill[]> {
         const skill: Skill = {
           name: typeof frontmatter.name === 'string' ? frontmatter.name : entry.name,
           description: typeof frontmatter.description === 'string' ? frontmatter.description : '',
-          triggers: Array.isArray(frontmatter.triggers) ? frontmatter.triggers as string[] : [],
+          triggers: toStringArray(frontmatter.triggers),
+          tags: toStringArray(frontmatter.tags),
+          category: typeof frontmatter.category === 'string' ? frontmatter.category : undefined,
+          audience: typeof frontmatter.audience === 'string' ? frontmatter.audience : undefined,
+          domains: toStringArray(frontmatter.domains),
+          inputs: toStringArray(frontmatter.inputs),
+          outputs: toStringArray(frontmatter.outputs),
+          order: typeof frontmatter.order === 'number' ? frontmatter.order : 1000,
           body,
           dir: skillDir,
         }
@@ -85,7 +127,14 @@ export function matchSkills(message: string, skills: Skill[]): Skill[] {
 // Build metadata string for system prompt (always in context)
 export function buildSkillsMetadata(skills: Skill[]): string {
   if (skills.length === 0) return ''
-  const lines = skills.map(s => `- **${s.name}**: ${s.description}`)
+  const lines = skills.map((s) => {
+    const suffix: string[] = []
+    if (s.category) suffix.push(`category: ${s.category}`)
+    if (s.audience) suffix.push(`audience: ${s.audience}`)
+    if (s.domains.length > 0) suffix.push(`domains: ${s.domains.join(', ')}`)
+    if (s.tags.length > 0) suffix.push(`tags: ${s.tags.join(', ')}`)
+    return `- **${s.name}**: ${s.description}${suffix.length > 0 ? ` (${suffix.join(' | ')})` : ''}`
+  })
   return `## Available Skills\n${lines.join('\n')}`
 }
 
@@ -94,4 +143,3 @@ export function buildActiveSkillContent(activeSkills: Skill[]): string {
   if (activeSkills.length === 0) return ''
   return activeSkills.map(s => `## Skill: ${s.name}\n${s.body}`).join('\n\n')
 }
-
