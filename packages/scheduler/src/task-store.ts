@@ -125,7 +125,7 @@ export class TaskStore {
         timezone TEXT DEFAULT 'Europe/Moscow',
         max_retries INTEGER DEFAULT 0,
         retry_count INTEGER DEFAULT 0,
-        timeout_ms INTEGER DEFAULT 120000,
+        timeout_ms INTEGER DEFAULT 600000,
         enabled INTEGER DEFAULT 1,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
@@ -170,7 +170,7 @@ export class TaskStore {
       input.createdBy || 'agent', input.assignee || null, input.dueAt || null,
       input.cron || null, input.prompt || null, JSON.stringify(input.tags || []),
       input.timezone || 'Europe/Moscow', input.maxRetries || 0,
-      input.timeoutMs || 120000, now, now,
+      input.timeoutMs || 600000, now, now,
     )
 
     return this.get(id)!
@@ -188,7 +188,7 @@ export class TaskStore {
       input.createdBy || 'system', input.assignee || null, input.dueAt || null,
       input.cron || null, input.prompt || null, JSON.stringify(input.tags || []),
       input.timezone || 'Europe/Moscow', input.maxRetries || 0,
-      input.timeoutMs || 120000, now, now,
+      input.timeoutMs || 600000, now, now,
     )
 
     return this.get(id)!
@@ -361,7 +361,7 @@ export class TaskStore {
       prompt: row.prompt || undefined, result: row.result || undefined,
       tags: JSON.parse(row.tags || '[]'), timezone: row.timezone || 'Europe/Moscow',
       maxRetries: row.max_retries || 0, retryCount: row.retry_count || 0,
-      timeoutMs: row.timeout_ms || 120000, enabled: row.enabled !== 0,
+      timeoutMs: row.timeout_ms || 600000, enabled: row.enabled !== 0,
       createdAt: row.created_at, updatedAt: row.updated_at,
     }
   }
