@@ -69,6 +69,20 @@ export async function delegateTask(
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeout)
 
+  // Open a delegate.X parent span and spawn a child tracer that nests
+  // sub-agent spans under it. This gives a real-time hierarchy
+  // (parent → delegate → sub-agent.turn → llm.generate / tool.X) instead of
+  // the older post-hoc reconstruction. Spans are still routed through the
+  // parent's exporter so they end up in the same per-session jsonl file.
+  const parentTracer = options?.tracer
+  const delegateSpan = parentTracer?.beginDelegateSpan(agent.id, task)
+  const childTracer = parentTracer && delegateSpan
+    ? parentTracer.spawnChild(delegateSpan.spanId, { agentId: agent.id })
+    : undefined
+
+  let subCost = 0
+  let subTurns = 0
+
   try {
     const gen = agentLoop(
       { provider, toolRegistry, systemPrompt, config: { maxTurns: 20, maxCostPerSession: 2 } },
@@ -79,17 +93,25 @@ export async function delegateTask(
 
     for await (const event of gen) {
       events.push(event)
+      childTracer?.processEvent(event)
       if (event.type === 'response') {
         result = event.content
+        subTurns++
       }
     }
+    subCost = childTracer?.getSessionCost() || 0
 
     const delegateResult: DelegateResult = { status: 'completed', result: result || 'Sub-agent completed without response.', events }
-    options?.tracer?.processDelegation(agent.id, task, events, 'completed')
+    if (parentTracer && delegateSpan) {
+      parentTracer.finishDelegateSpan(delegateSpan, 'completed', { turns: subTurns, cost: subCost })
+    }
     return delegateResult
   } catch (err) {
+    subCost = childTracer?.getSessionCost() || 0
     const delegateResult: DelegateResult = { status: 'failed', result: `Sub-agent error: ${(err as Error).message}`, events }
-    options?.tracer?.processDelegation(agent.id, task, events, 'failed')
+    if (parentTracer && delegateSpan) {
+      parentTracer.finishDelegateSpan(delegateSpan, 'failed', { turns: subTurns, cost: subCost })
+    }
     return delegateResult
   } finally {
     clearTimeout(timer)

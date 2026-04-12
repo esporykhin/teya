@@ -12,7 +12,69 @@ import type {
   ToolDefinition,
   Message,
   ProviderCapabilities,
+  GenerationDetails,
+  TransportMetrics,
 } from '@teya/core'
+import { readFileSync, writeFileSync, mkdirSync, statSync } from 'fs'
+import { join } from 'path'
+import { homedir } from 'os'
+
+// ─── OpenRouter models cache (pricing + context) ─────────────────────────────
+// Cached on disk so we have real costs from the very first request after the
+// first successful fetch. Background-refreshed when stale.
+
+interface ORModel {
+  id: string
+  pricing?: { prompt?: string; completion?: string }
+  context_length?: number
+  top_provider?: { max_completion_tokens?: number }
+}
+
+const MODELS_CACHE_FILE = join(homedir(), '.teya', 'openrouter-models.json')
+const MODELS_CACHE_TTL_MS = 24 * 60 * 60 * 1000
+
+let cachedModels: Map<string, ORModel> | null = null
+let refreshInFlight: Promise<void> | null = null
+
+function loadModelsCacheSync(): { models: Map<string, ORModel> | null; mtimeMs: number } {
+  try {
+    const stat = statSync(MODELS_CACHE_FILE)
+    const data = JSON.parse(readFileSync(MODELS_CACHE_FILE, 'utf-8')) as ORModel[]
+    return { models: new Map(data.map(m => [m.id, m])), mtimeMs: stat.mtimeMs }
+  } catch {
+    return { models: null, mtimeMs: 0 }
+  }
+}
+
+async function refreshModelsCache(): Promise<void> {
+  if (refreshInFlight) return refreshInFlight
+  refreshInFlight = (async () => {
+    try {
+      const r = await fetch('https://openrouter.ai/api/v1/models')
+      if (!r.ok) return
+      const json = (await r.json()) as { data: ORModel[] }
+      mkdirSync(join(homedir(), '.teya'), { recursive: true })
+      writeFileSync(MODELS_CACHE_FILE, JSON.stringify(json.data), 'utf-8')
+      cachedModels = new Map(json.data.map(m => [m.id, m]))
+    } catch {
+      // network failure — keep whatever we had
+    } finally {
+      refreshInFlight = null
+    }
+  })()
+  return refreshInFlight
+}
+
+function applyModelInfo(capabilities: ProviderCapabilities, info: ORModel | undefined): void {
+  if (!info) return
+  const promptPrice = Number(info.pricing?.prompt ?? '0')
+  const completionPrice = Number(info.pricing?.completion ?? '0')
+  if (Number.isFinite(promptPrice) && promptPrice > 0) capabilities.costPerInputToken = promptPrice
+  if (Number.isFinite(completionPrice) && completionPrice > 0) capabilities.costPerOutputToken = completionPrice
+  if (info.context_length && info.context_length > 0) capabilities.maxContextTokens = info.context_length
+  const maxOut = info.top_provider?.max_completion_tokens
+  if (maxOut && maxOut > 0) capabilities.maxOutputTokens = maxOut
+}
 
 // ─── OpenAI-compatible wire types ────────────────────────────────────────────
 
@@ -57,6 +119,10 @@ interface OAIResponse {
     prompt_tokens: number
     completion_tokens: number
     total_tokens: number
+    /** OpenRouter / OpenAI cached prompt tokens. */
+    prompt_tokens_details?: { cached_tokens?: number }
+    /** Reasoning tokens for o1/r1-style models. */
+    completion_tokens_details?: { reasoning_tokens?: number }
   }
 }
 
@@ -256,22 +322,35 @@ const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 520, 521, 522, 523, 524])
 const MAX_RETRIES = 3
 const BASE_DELAY_MS = 1000
 
+interface FetchWithRetryResult {
+  response: Response
+  retryCount: number
+  /** Time-to-first-byte for the FINAL successful attempt (ms from POST start). */
+  ttfbMs: number
+  /** Wall-clock for the final successful attempt only. */
+  attemptStartMs: number
+}
+
 async function fetchWithRetry(
   url: string,
   init: RequestInit,
   signal?: AbortSignal,
-): Promise<Response> {
+): Promise<FetchWithRetryResult> {
   let lastError: Error | null = null
+  let retryCount = 0
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     if (signal?.aborted) throw new Error('Request aborted')
 
     try {
+      const attemptStartMs = Date.now()
       const response = await fetch(url, { ...init, signal })
+      // TTFB = headers received. fetch() resolves at headers, body still streaming.
+      const ttfbMs = Date.now() - attemptStartMs
 
       // Success or non-retryable error — return immediately
       if (response.ok || !RETRYABLE_STATUS.has(response.status)) {
-        return response
+        return { response, retryCount, ttfbMs, attemptStartMs }
       }
 
       // Retryable status — read error for logging, then retry
@@ -280,18 +359,16 @@ async function fetchWithRetry(
 
       if (attempt < MAX_RETRIES) {
         const delay = BASE_DELAY_MS * Math.pow(2, attempt) + Math.random() * 500
-        const status = response.status
-        // Retry silently — tracing captures the span timing
+        retryCount++
         await new Promise(resolve => setTimeout(resolve, delay))
       }
     } catch (err) {
-      // Network error (ECONNREFUSED, timeout, etc.)
       lastError = err as Error
       if (signal?.aborted) throw lastError
 
       if (attempt < MAX_RETRIES) {
         const delay = BASE_DELAY_MS * Math.pow(2, attempt) + Math.random() * 500
-        // Retry silently
+        retryCount++
         await new Promise(resolve => setTimeout(resolve, delay))
       }
     }
@@ -322,6 +399,23 @@ export function openrouter(config: {
     costPerOutputToken: 0,
   }
 
+  // Hydrate capabilities from cached OpenRouter /models data. The tracer holds
+  // a reference to this object, so background updates take effect live.
+  let cacheMtime = 0
+  if (!cachedModels) {
+    const loaded = loadModelsCacheSync()
+    cachedModels = loaded.models
+    cacheMtime = loaded.mtimeMs
+  } else {
+    try { cacheMtime = statSync(MODELS_CACHE_FILE).mtimeMs } catch {}
+  }
+  applyModelInfo(capabilities, cachedModels?.get(config.model))
+
+  const cacheStale = !cacheMtime || Date.now() - cacheMtime > MODELS_CACHE_TTL_MS
+  if (cacheStale) {
+    refreshModelsCache().then(() => applyModelInfo(capabilities, cachedModels?.get(config.model)))
+  }
+
   async function generate(
     request: GenerateRequest,
     options?: GenerateOptions,
@@ -346,14 +440,18 @@ export function openrouter(config: {
       body.stop = request.stop
     }
 
-    const response = await fetchWithRetry(endpoint, {
+    const requestBodyText = JSON.stringify(body)
+    const requestBytes = Buffer.byteLength(requestBodyText, 'utf-8')
+    const httpStartMs = Date.now()
+
+    const { response, retryCount, ttfbMs, attemptStartMs } = await fetchWithRetry(endpoint, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${config.apiKey}`,
         'Content-Type': 'application/json',
         'HTTP-Referer': 'https://teya.dev',
       },
-      body: JSON.stringify(body),
+      body: requestBodyText,
     }, options?.signal)
 
     if (!response.ok) {
@@ -361,9 +459,23 @@ export function openrouter(config: {
       throw new Error(`OpenRouter HTTP ${response.status}: ${errorText}`)
     }
 
-    const data = (await response.json()) as OAIResponse
+    const responseBodyText = await response.text()
+    const httpLatencyMs = Date.now() - attemptStartMs
+    const responseBytes = Buffer.byteLength(responseBodyText, 'utf-8')
+
+    const data = JSON.parse(responseBodyText) as OAIResponse
     const choice = data.choices[0]
     const message = choice.message
+    const cachedInputTokens = data.usage.prompt_tokens_details?.cached_tokens
+    const reasoningTokens = data.usage.completion_tokens_details?.reasoning_tokens
+
+    const transport: TransportMetrics = {
+      httpLatencyMs,
+      ttfbMs,
+      requestBytes,
+      responseBytes,
+      statusCode: response.status,
+    }
 
     return {
       content: message.content ?? '',
@@ -372,9 +484,61 @@ export function openrouter(config: {
         inputTokens: data.usage.prompt_tokens,
         outputTokens: data.usage.completion_tokens,
         totalTokens: data.usage.total_tokens,
+        ...(cachedInputTokens !== undefined ? { cachedInputTokens } : {}),
+        ...(reasoningTokens !== undefined ? { reasoningTokens } : {}),
       },
       model: data.model,
       finishReason: mapFinishReason(choice.finish_reason),
+      generationId: data.id,
+      retryCount,
+      transport,
+      providerMetadata: { configuredModel: config.model, totalWallMs: Date.now() - httpStartMs },
+    }
+  }
+
+  // ── getGenerationDetails — pulls authoritative billing from OpenRouter ─────
+  // Endpoint: GET https://openrouter.ai/api/v1/generation?id=<id>
+  // Real response shape (verified 2026-04):
+  //   data: {
+  //     usage: 0.00253,                       // <-- USD cost
+  //     native_tokens_prompt / completion / cached / reasoning,
+  //     generation_time: 1900,                // ms
+  //     provider_responses: [{ provider_name: 'Alibaba', latency: 1227, ... }],
+  //     finish_reason, ...
+  //   }
+  // Best-effort: any failure resolves to null so tracing never breaks the agent.
+  async function getGenerationDetails(generationId: string): Promise<GenerationDetails | null> {
+    try {
+      const url = `${baseUrl}/generation?id=${encodeURIComponent(generationId)}`
+      const r = await fetch(url, {
+        headers: { Authorization: `Bearer ${config.apiKey}` },
+      })
+      if (!r.ok) return null
+      const json = (await r.json()) as { data?: Record<string, unknown> }
+      const d = json.data
+      if (!d) return null
+
+      const num = (k: string): number | undefined => {
+        const v = d[k]
+        return typeof v === 'number' && Number.isFinite(v) ? v : undefined
+      }
+
+      const providerResponses = d['provider_responses'] as Array<Record<string, unknown>> | undefined
+      const firstProvider = providerResponses?.[0]
+      const providerName = typeof firstProvider?.['provider_name'] === 'string'
+        ? (firstProvider['provider_name'] as string)
+        : undefined
+
+      return {
+        generationId,
+        actualCostUsd: num('usage') ?? num('total_cost'),
+        cachedInputTokens: num('native_tokens_cached'),
+        latencyMs: num('generation_time') ?? num('latency'),
+        providerName,
+        raw: d,
+      }
+    } catch {
+      return null
     }
   }
 
@@ -402,7 +566,7 @@ export function openrouter(config: {
       body.stop = request.stop
     }
 
-    const response = await fetchWithRetry(endpoint, {
+    const { response } = await fetchWithRetry(endpoint, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${config.apiKey}`,
@@ -520,8 +684,10 @@ export function openrouter(config: {
 
   return {
     name: `openrouter:${config.model}`,
+    type: 'openrouter',
     capabilities,
     generate,
     stream,
+    getGenerationDetails,
   }
 }

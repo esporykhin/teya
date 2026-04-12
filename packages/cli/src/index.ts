@@ -16,7 +16,7 @@ import { CLITransport } from '@teya/transport-cli'
 import { TelegramTransport, TelegramUserbotTransport, createTelegramTool } from '@teya/transport-telegram'
 import { SessionStore, KnowledgeGraph, createMemoryTools, AssetStore, createAssetTools, ollamaEmbeddings } from '@teya/memory'
 import type { SessionState } from '@teya/core'
-import { AgentTracer, consoleExporter, jsonExporter } from '@teya/tracing'
+import { AgentTracer, consoleExporter, jsonExporter, sessionFileExporter, compositeExporter, GenerationEnricher } from '@teya/tracing'
 import { TaskStore, createTaskTools, HealthManager } from '@teya/scheduler'
 import { DataStore, createDataTools } from '@teya/data'
 
@@ -195,6 +195,14 @@ if (subcommand === 'scheduler') {
   process.exit(0)
 }
 
+// Trace viewer subcommand — read-only inspection of jsonl traces.
+// Decoupled from the main agent boot path so it doesn't open DBs / providers.
+if (subcommand === 'trace') {
+  const { handleTraceCommand } = await import('./trace-cli.js')
+  await handleTraceCommand(process.argv.slice(3))
+  process.exit(0)
+}
+
 // teya eval run <suite.yaml>
 if (subcommand === 'eval') {
   const action = process.argv[3]
@@ -298,6 +306,11 @@ async function main() {
   // Create primary provider
   let provider: LLMProvider = makeProvider(providerType, model, apiKey, args['base-url'])
 
+  // Forward declare so the fallback onFallback callback can reach the tracer
+  // — tracer itself is created later (after provider, since it needs caps).
+  // We assign once both exist via this holder.
+  const tracerHolder: { current: AgentTracer | null } = { current: null }
+
   // Wrap with fallback if configured
   const fallbackType = args['fallback'] ?? process.env.TEYA_FALLBACK ?? (saved as any).fallback?.provider ?? ''
   if (fallbackType) {
@@ -309,26 +322,50 @@ async function main() {
       onFallback: (from, to, err) => {
         console.log(`\x1b[33m[fallback] ${from} failed: ${err.message}\x1b[0m`)
         console.log(`\x1b[33m[fallback] switching to ${to}\x1b[0m`)
+        // Pipe into the trace stream so post-mortem analysis can spot
+        // sessions where the user got a degraded model silently.
+        tracerHolder.current?.processEvent({
+          type: 'provider_fallback',
+          from,
+          to,
+          error: err.message,
+        })
       },
     })
   }
 
-  // Create tracer based on --tracing flag (early, so it can be passed to delegate tool)
-  const tracingMode = args['tracing'] || ''
+  // Create tracer. By default we write BOTH a per-session jsonl (for fast
+  // `teya trace show <id>` lookup) and a daily aggregate (for cost rollups).
+  // Disable with --tracing none. Override with --tracing console|otlp.
+  const tracingMode = (args['tracing'] || 'json') as string
   let tracer: AgentTracer | null = null
   const tracerConfig = { capabilities: provider.capabilities }
   if (tracingMode === 'console') {
     tracer = new AgentTracer(consoleExporter, tracerConfig)
+    tracerHolder.current = tracer
   } else if (tracingMode === 'json') {
-    const tracePath = args['trace-file'] || join(CONFIG_DIR, 'traces', `${Date.now()}.jsonl`)
-    tracer = new AgentTracer(jsonExporter(tracePath), tracerConfig)
-    console.log(`\x1b[90mTracing to ${tracePath}\x1b[0m`)
+    const today = new Date().toISOString().slice(0, 10)
+    const dailyPath = args['trace-file'] || join(CONFIG_DIR, 'traces', `${today}.jsonl`)
+    const sessionsDir = join(CONFIG_DIR, 'traces', 'sessions')
+    const exporter = compositeExporter(jsonExporter(dailyPath), sessionFileExporter(sessionsDir))
+    tracer = new AgentTracer(exporter, tracerConfig)
+    tracerHolder.current = tracer
+    console.log(`\x1b[90mTracing: ${dailyPath} + sessions/<id>.jsonl\x1b[0m`)
   } else if (tracingMode === 'otlp') {
     const { otlpExporter } = await import('@teya/tracing')
     const endpoint = args['otlp-endpoint'] || 'http://localhost:4318/v1/traces'
     tracer = new AgentTracer(otlpExporter(endpoint), tracerConfig)
+    tracerHolder.current = tracer
     console.log(`\x1b[90mTracing OTLP to ${endpoint}\x1b[0m`)
   }
+  // tracingMode === 'none' (or anything else) → tracer stays null
+
+  // Enricher: backfills authoritative billing details (real cost, cached
+  // tokens, provider name) by polling provider.getGenerationDetails() in the
+  // background. Decoupled from agent loop so we never block on it.
+  const enricher = tracer && provider.getGenerationDetails
+    ? new GenerationEnricher(provider, tracer)
+    : null
 
   // Initialize workspace (sandboxed directory for agent file operations)
   const workspaceRoot = await initWorkspace()
@@ -444,10 +481,36 @@ async function main() {
     console.log(`\x1b[90mSession ${currentSession.id.slice(0, 8)}\x1b[0m`)
   }
 
+  // Seed the tracer with stable per-session attributes. Every span the
+  // tracer emits from now on inherits these — that's how `teya trace show <id>`
+  // can route per-session jsonl reliably.
+  tracer?.setContext({
+    sessionId: currentSession.id,
+    agentId: currentSession.agentId || 'default',
+    transport: transportType,
+  })
+
   // Track metadata during session
   const sessionToolsUsed = new Set<string>(currentSession.toolsUsed || [])
   const sessionAgentsUsed = new Set<string>(currentSession.agentsUsed || [])
   const sessionTaskIds = new Set<string>(currentSession.taskIds || [])
+
+  // Reset everything: new session row, empty history, clear tracked metadata.
+  // Used by /clear (CLI) and /clear via Telegram message intercept.
+  function resetSession() {
+    currentSession = sessionStore.createSession('default', transportType)
+    conversationHistory = []
+    toolLoader.resetSession()
+    sessionToolsUsed.clear()
+    sessionAgentsUsed.clear()
+    sessionTaskIds.clear()
+    tracer?.resetForNewSession(currentSession.id)
+    tracer?.setContext({
+      sessionId: currentSession.id,
+      agentId: 'default',
+      transport: transportType,
+    })
+  }
 
   // Create transport
   const telegramToken = args['telegram-token'] || process.env.TELEGRAM_BOT_TOKEN || saved.telegramToken || ''
@@ -549,14 +612,28 @@ async function main() {
         }
 
         case '/clear': {
-          currentSession = sessionStore.createSession()
-          conversationHistory = []
-          toolLoader.resetSession()
+          resetSession()
           ;(transport as CLITransport).setSessionId(currentSession.id)
           console.clear()
           console.log('\x1b[1mTeya\x1b[0m')
           console.log(`\x1b[90mNew session ${currentSession.id.slice(0, 8)}. Type / for commands.\x1b[0m\n`)
           break
+        }
+
+        case '/exit': {
+          // Drain any pending billing lookups so the trace files contain
+          // authoritative cost data before we leave. OpenRouter's
+          // /generation endpoint can take 30-60s to surface fresh ids.
+          if (enricher) {
+            console.log('\x1b[90mFlushing trace enricher (up to 60s)...\x1b[0m')
+            await enricher.drain(60_000)
+            enricher.stop()
+          }
+          // Close the session-rollup span so the per-session jsonl ends
+          // with a single agent.session row containing final totals.
+          tracer?.finishSession('exit')
+          console.log('\x1b[90mGoodbye.\x1b[0m')
+          process.exit(0)
         }
 
         case '/tools':
@@ -656,6 +733,37 @@ async function main() {
   transport.onMessage(async (message, sessionId, images) => {
     abortController = new AbortController()
 
+    // Slash command intercept — works for ALL transports (Telegram included).
+    // Without this, /clear typed in Telegram goes to the LLM as a normal message
+    // and the conversation history keeps growing forever.
+    const trimmed = message.trim()
+    if (trimmed.startsWith('/')) {
+      const cmd = trimmed.split(/\s+/)[0]
+      if (cmd === '/clear') {
+        resetSession()
+        const note = `New session ${currentSession.id.slice(0, 8)}.`
+        if (isTelegramAny) transport.send({ type: 'response', content: note }, sessionId)
+        else { console.clear(); console.log('\x1b[1mTeya\x1b[0m'); console.log(`\x1b[90m${note}\x1b[0m\n`); (transport as CLITransport).prompt() }
+        return
+      }
+      if (cmd === '/compact') {
+        conversationHistory = []
+        currentSession = { ...currentSession, messages: [] }
+        await sessionStore.save(currentSession)
+        const note = 'Context cleared. Session preserved.'
+        if (isTelegramAny) transport.send({ type: 'response', content: note }, sessionId)
+        else { console.log(`\x1b[90m${note}\x1b[0m\n`); (transport as CLITransport).prompt() }
+        return
+      }
+      if (cmd === '/status') {
+        const tokens = Math.ceil(conversationHistory.reduce((s, m) => s + (m.content?.length || 0), 0) / 3.5)
+        const note = `session=${currentSession.id.slice(0, 8)} messages=${conversationHistory.length} ~tokens=${tokens} turns=${currentSession.totalTurns} cost=$${(currentSession.totalCost || 0).toFixed(4)}`
+        if (isTelegramAny) transport.send({ type: 'response', content: note }, sessionId)
+        else { console.log(`\x1b[90m${note}\x1b[0m\n`); (transport as CLITransport).prompt() }
+        return
+      }
+    }
+
     // Auto-switch to vision model when images are attached
     let activeProvider = provider
     if (images && images.length > 0) {
@@ -672,6 +780,10 @@ async function main() {
         activeProvider = openrouter({ model: visionModel, apiKey })
       }
     }
+
+    // Stamp the current user message into trace context so spans created
+    // during this turn carry it. Truncated to keep traces compact.
+    tracer?.setContext({ userMessage: message.slice(0, 500) })
 
     try {
       const events = agentLoop(
@@ -691,6 +803,12 @@ async function main() {
 
       for await (const event of events) {
         tracer?.processEvent(event)
+
+        // Schedule background billing lookup for each LLM call. Snapshots
+        // current trace context so the late span lands in the right session.
+        if (event.type === 'thinking_end' && event.generationId && enricher) {
+          enricher.enqueue(event.generationId, tracer!.getContext())
+        }
 
         // Track session metadata from events
         if (event.type === 'tool_start') {

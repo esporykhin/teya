@@ -2,7 +2,7 @@
  * @description Fallback chain — tries providers in order on failure
  * @exports fallback
  */
-import type { LLMProvider, GenerateRequest, GenerateOptions, GenerateResponse } from '@teya/core'
+import type { LLMProvider, GenerateRequest, GenerateOptions, GenerateResponse, GenerationDetails } from '@teya/core'
 
 interface FallbackConfig {
   retries?: number      // per provider, default 1
@@ -18,6 +18,7 @@ export function fallback(providers: LLMProvider[], config: FallbackConfig = {}):
 
   return {
     name: `fallback(${providers.map(p => p.name).join(', ')})`,
+    type: 'fallback',
     capabilities: providers[0].capabilities,
 
     async generate(request: GenerateRequest, options?: GenerateOptions): Promise<GenerateResponse> {
@@ -28,17 +29,25 @@ export function fallback(providers: LLMProvider[], config: FallbackConfig = {}):
 
         for (let attempt = 0; attempt <= retries; attempt++) {
           try {
-            return await provider.generate(request, options)
+            const result = await provider.generate(request, options)
+            // Tag which underlying provider actually handled the request — vital
+            // for tracing and cost attribution when fallbacks fire.
+            return {
+              ...result,
+              providerMetadata: {
+                ...(result.providerMetadata || {}),
+                fallbackHandler: provider.name,
+                fallbackType: provider.type,
+              },
+            }
           } catch (error) {
             lastError = error as Error
 
             if (attempt < retries) {
-              // Retry same provider
               await new Promise(resolve => setTimeout(resolve, retryDelay))
               continue
             }
 
-            // Move to next provider
             if (i + 1 < providers.length) {
               config.onFallback?.(provider.name, providers[i + 1].name, lastError)
             }
@@ -47,6 +56,20 @@ export function fallback(providers: LLMProvider[], config: FallbackConfig = {}):
       }
 
       throw lastError || new Error('All providers failed')
+    },
+
+    // Try each underlying provider that supports lookup until one resolves.
+    async getGenerationDetails(generationId: string): Promise<GenerationDetails | null> {
+      for (const p of providers) {
+        if (!p.getGenerationDetails) continue
+        try {
+          const d = await p.getGenerationDetails(generationId)
+          if (d) return d
+        } catch {
+          // try next
+        }
+      }
+      return null
     },
   }
 }

@@ -2,7 +2,7 @@
  * @description Multi-model routing — different models for thinking, planning, condensing
  * @exports router
  */
-import type { LLMProvider, GenerateRequest, GenerateOptions, GenerateResponse } from '@teya/core'
+import type { LLMProvider, GenerateRequest, GenerateOptions, GenerateResponse, GenerationDetails } from '@teya/core'
 
 type Phase = 'default' | 'planning' | 'condensing'
 
@@ -23,6 +23,7 @@ export function router(config: RouterConfig): LLMProvider & { setPhase(phase: Ph
 
   return {
     name: 'router',
+    type: 'router',
     get capabilities() { return getProvider().capabilities },
 
     async generate(request: GenerateRequest, options?: GenerateOptions): Promise<GenerateResponse> {
@@ -34,6 +35,11 @@ export function router(config: RouterConfig): LLMProvider & { setPhase(phase: Ph
       if (provider.stream) {
         yield* provider.stream(request, options)
       }
+    },
+
+    async getGenerationDetails(generationId: string): Promise<GenerationDetails | null> {
+      const provider = getProvider()
+      return provider.getGenerationDetails ? provider.getGenerationDetails(generationId) : null
     },
 
     setPhase(phase: Phase) { currentPhase = phase },

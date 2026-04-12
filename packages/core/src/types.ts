@@ -62,6 +62,11 @@ export interface LLMProvider {
   stream?(request: GenerateRequest, options?: GenerateOptions): AsyncGenerator<StreamChunk>
   capabilities: ProviderCapabilities
   name: string
+  /** Provider type identifier (e.g. 'openrouter', 'codex', 'ollama'). */
+  type?: string
+  /** Optional: resolve authoritative billing/cache details from a generationId.
+   *  Implementations should be cheap and best-effort (network failures must not throw). */
+  getGenerationDetails?(generationId: string): Promise<GenerationDetails | null>
 }
 
 export interface ProviderCapabilities {
@@ -96,6 +101,52 @@ export interface GenerateResponse {
   usage: TokenUsage
   model: string
   finishReason: 'stop' | 'tool_calls' | 'length' | 'error'
+  /** Provider-assigned generation id (e.g. OpenRouter `id`). Enables follow-up
+   *  calls like provider.getGenerationDetails() for actual cost / cache stats. */
+  generationId?: string
+  /** Number of HTTP retries the provider performed for this call (>=0). */
+  retryCount?: number
+  /** Detailed transport-level metrics. Tracing splits "where time goes":
+   *  network vs cognition vs first-token vs streaming. Optional — providers
+   *  fill what they can measure. */
+  transport?: TransportMetrics
+  /** Free-form provider-specific metadata captured for tracing. */
+  providerMetadata?: Record<string, unknown>
+}
+
+/** Transport-level metrics captured by the provider during a generation.
+ *  Helps distinguish "the LLM is slow" from "the network is slow". */
+export interface TransportMetrics {
+  /** Total HTTP wall-clock latency in ms (from POST to body close). */
+  httpLatencyMs?: number
+  /** Time from request start to first response byte (TTFB). */
+  ttfbMs?: number
+  /** Time from request start to first content/tool_call delta (streaming TTFT). */
+  ttftMs?: number
+  /** Bytes sent on the wire (request body length). */
+  requestBytes?: number
+  /** Bytes received on the wire. For streaming this is the total of all chunks. */
+  responseBytes?: number
+  /** HTTP status code returned. */
+  statusCode?: number
+  /** Number of streaming chunks received (only for streamed responses). */
+  streamChunks?: number
+}
+
+/** Optional follow-up details a provider may resolve from a generation id.
+ *  OpenRouter exposes /api/v1/generation/{id} with the authoritative numbers. */
+export interface GenerationDetails {
+  generationId: string
+  /** Actual cost in USD as billed by the provider — most accurate value. */
+  actualCostUsd?: number
+  /** Tokens served from prompt cache (subset of input tokens). */
+  cachedInputTokens?: number
+  /** Total provider-side latency in ms. */
+  latencyMs?: number
+  /** Underlying provider name (OpenRouter routes to many). */
+  providerName?: string
+  /** Raw payload for tracing fidelity. */
+  raw?: Record<string, unknown>
 }
 
 export interface StreamChunk {
@@ -109,6 +160,11 @@ export interface TokenUsage {
   inputTokens: number
   outputTokens: number
   totalTokens: number
+  /** Tokens served from prompt cache (subset of inputTokens). Optional —
+   *  set only when the provider reports it (OpenRouter, Anthropic, etc). */
+  cachedInputTokens?: number
+  /** Reasoning/thinking tokens billed separately from completion (o1, deepseek-r1). */
+  reasoningTokens?: number
 }
 
 // ─── Agent Events ─────────────────────────────────────────────────────────────
@@ -121,18 +177,80 @@ export interface PlanStep {
 
 export type AgentEvent =
   | { type: 'thinking_start' }
-  | { type: 'thinking_end'; tokens: TokenUsage }
+  | {
+      type: 'thinking_end'
+      tokens: TokenUsage
+      /** Model that actually served this request (post-fallback). */
+      model?: string
+      /** Provider that served this request ('openrouter' | 'codex' | ...). */
+      provider?: string
+      /** Why generation stopped — 'stop' | 'tool_calls' | 'length' | 'error'. */
+      finishReason?: 'stop' | 'tool_calls' | 'length' | 'error'
+      /** HTTP retries the provider performed for this generation. */
+      retryCount?: number
+      /** Provider-assigned id (enables follow-up cost lookup). */
+      generationId?: string
+      /** Wall-clock duration of the generate() call in ms. */
+      latencyMs?: number
+      /** Transport-level metrics (network/TTFB/TTFT/bytes). */
+      transport?: TransportMetrics
+    }
+  /** Emitted after the request is built but before the network call.
+   *  Carries the per-component token decomposition so consumers know
+   *  what's actually being sent on the wire. */
+  | {
+      type: 'request_prepared'
+      model: string
+      provider: string
+      systemTokens: number
+      messagesTokens: number
+      toolsTokens: number
+      messagesCount: number
+      toolsCount: number
+      totalInputTokensEstimate: number
+    }
+  /** Emitted asynchronously after thinking_end when provider can fetch
+   *  authoritative billing/cache details (OpenRouter /generation). */
+  | {
+      type: 'generation_details'
+      generationId: string
+      actualCostUsd?: number
+      cachedInputTokens?: number
+      latencyMs?: number
+      providerName?: string
+    }
+  /** Emitted by the fallback provider when the primary provider failed and
+   *  it switched to the next one. Critical for spotting silent quality drops. */
+  | {
+      type: 'provider_fallback'
+      from: string
+      to: string
+      error: string
+    }
   | { type: 'content_delta'; text: string }
   | { type: 'response'; content: string }
-  | { type: 'tool_start'; tool: string; args: Record<string, unknown> }
-  | { type: 'tool_result'; tool: string; result: string }
-  | { type: 'tool_error'; tool: string; error: string }
+  | { type: 'tool_start'; tool: string; args: Record<string, unknown>; callId?: string }
+  | {
+      type: 'tool_result'
+      tool: string
+      result: string
+      callId?: string
+      /** Wall-clock duration of the tool execution in ms. */
+      latencyMs?: number
+    }
+  | { type: 'tool_error'; tool: string; error: string; callId?: string; latencyMs?: number }
   | { type: 'tool_denied'; tool: string }
   | { type: 'tool_not_found'; tool: string }
   | { type: 'plan_proposed'; steps: PlanStep[] }
   | { type: 'plan_approved' }
   | { type: 'plan_rejected'; reason?: string }
-  | { type: 'context_compacted'; before: number; after: number }
+  | {
+      type: 'context_compacted'
+      before: number
+      after: number
+      /** Which condenser phase actually changed the message list. */
+      phase?: 'trim_tool_results' | 'drop_thinking' | 'summarize' | 'hard_truncate'
+    }
   | { type: 'error'; error: string; phase: string }
   | { type: 'cancelled' }
   | { type: 'max_turns_reached'; turns: number }

@@ -295,6 +295,7 @@ export function ollama(config: {
 
   return {
     name: `ollama:${config.model}`,
+    type: 'ollama',
     capabilities,
     generate,
     stream,

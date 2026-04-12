@@ -241,6 +241,7 @@ export function codex(config: {
 
   return {
     name: `codex${model ? ':' + model : ''}`,
+    type: 'codex',
     capabilities,
     generate,
   }

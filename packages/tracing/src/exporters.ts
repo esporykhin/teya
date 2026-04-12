@@ -24,12 +24,27 @@ export function consoleExporter(span: Span): void {
 // ── JSON exporter — append to file ──────────────────────────────────────────
 
 import { appendFileSync, mkdirSync } from 'fs'
-import { dirname } from 'path'
+import { dirname, join } from 'path'
 
 export function jsonExporter(filePath: string): (span: Span) => void {
   mkdirSync(dirname(filePath), { recursive: true })
   return (span: Span) => {
     appendFileSync(filePath, JSON.stringify(span) + '\n', 'utf-8')
+  }
+}
+
+/**
+ * Routes spans into per-session jsonl files based on the `session.id` attribute.
+ * Spans without a session id fall back to `_unattributed.jsonl`. This is the
+ * primary exporter for `teya trace show <session>` — it makes per-session
+ * lookups O(1) instead of grepping a single growing daily file.
+ */
+export function sessionFileExporter(baseDir: string): (span: Span) => void {
+  mkdirSync(baseDir, { recursive: true })
+  return (span: Span) => {
+    const sessionId = (span.attributes['session.id'] as string) || '_unattributed'
+    const file = join(baseDir, `${sessionId}.jsonl`)
+    appendFileSync(file, JSON.stringify(span) + '\n', 'utf-8')
   }
 }
 

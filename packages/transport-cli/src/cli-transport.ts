@@ -254,8 +254,16 @@ export class CLITransport implements Transport {
       return
     }
     if (command === '/exit') {
-      console.log(gray('Goodbye.'))
-      process.exit(0)
+      // Route through the user-facing onCommand handler so the CLI can run
+      // any registered cleanup (e.g. drain the trace enricher) before exiting.
+      // The handler is responsible for calling process.exit().
+      if (this.commandHandler) {
+        await this.commandHandler(command)
+      } else {
+        console.log(gray('Goodbye.'))
+        process.exit(0)
+      }
+      return
     }
     if (command === '/img') {
       const image = getClipboardImage()

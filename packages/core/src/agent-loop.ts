@@ -28,8 +28,17 @@ function calculateBudget(capabilities: Pick<ProviderCapabilities, 'maxContextTok
 // Summarizer: takes a slice of messages and returns a summary string
 type Summarizer = (messages: Message[]) => Promise<string>
 
-async function condenseMessagesAsync(messages: Message[], budget: number, summarizer?: Summarizer): Promise<Message[]> {
+type CondensePhase = 'trim_tool_results' | 'drop_thinking' | 'summarize' | 'hard_truncate'
+
+interface CondenseResult {
+  messages: Message[]
+  /** Last phase that actually mutated the message list. Used by tracing. */
+  phase: CondensePhase
+}
+
+async function condenseMessagesAsync(messages: Message[], budget: number, summarizer?: Summarizer): Promise<CondenseResult> {
   let current = [...messages]
+  let phase: CondensePhase = 'trim_tool_results'
 
   // Phase 1: Trim old tool results (keep last 10 messages untouched)
   const toolResultCutoff = Math.max(0, current.length - 10)
@@ -38,17 +47,19 @@ async function condenseMessagesAsync(messages: Message[], budget: number, summar
       current[i] = { ...current[i], content: current[i].content.slice(0, 200) + '\n[...truncated]' }
     }
   }
-  if (estimateMessagesTokens(current) <= budget) return current
+  if (estimateMessagesTokens(current) <= budget) return { messages: current, phase }
 
   // Phase 2: Remove thinking tool results
+  phase = 'drop_thinking'
   current = current.filter((m, i) => {
     if (m.role === 'tool' && m.name === 'core:think' && i < toolResultCutoff) return false
     return true
   })
-  if (estimateMessagesTokens(current) <= budget) return current
+  if (estimateMessagesTokens(current) <= budget) return { messages: current, phase }
 
   // Phase 3: LLM Summarization
   if (summarizer && estimateMessagesTokens(current) > budget) {
+    phase = 'summarize'
     const systemMessages = current.filter(m => m.role === 'system')
     const nonSystemMessages = current.filter(m => m.role !== 'system')
     const splitPoint = Math.floor(nonSystemMessages.length * 0.6)
@@ -68,9 +79,10 @@ async function condenseMessagesAsync(messages: Message[], budget: number, summar
       }
     }
   }
-  if (estimateMessagesTokens(current) <= budget) return current
+  if (estimateMessagesTokens(current) <= budget) return { messages: current, phase }
 
   // Phase 4: Hard truncation — keep system messages + last N messages
+  phase = 'hard_truncate'
   const systemMessages = current.filter(m => m.role === 'system')
   const nonSystemMessages = current.filter(m => m.role !== 'system')
 
@@ -85,7 +97,18 @@ async function condenseMessagesAsync(messages: Message[], budget: number, summar
     content: `[Earlier messages truncated. ${nonSystemMessages.length - keepCount} messages removed to fit context window.]`,
   }
 
-  return [...systemMessages, truncatedSummary, ...keptMessages]
+  return { messages: [...systemMessages, truncatedSummary, ...keptMessages], phase }
+}
+
+/** Estimate tokens spent on tool definitions (name, description, JSON schema). */
+function estimateToolsTokens(tools: ToolDefinition[]): number {
+  let chars = 0
+  for (const t of tools) {
+    chars += (t.name?.length || 0) + (t.description?.length || 0)
+    try { chars += JSON.stringify(t.parameters).length } catch {}
+    chars += 20 // structural overhead per tool
+  }
+  return Math.ceil(chars / 3.5)
 }
 
 function truncateToolResult(result: string, maxChars: number = 5000): string {
@@ -244,14 +267,21 @@ async function executeToolCall(
     toolCall = modified
   }
 
-  events.push({ type: 'tool_start', tool: toolCall.name, args: toolCall.args })
+  events.push({ type: 'tool_start', tool: toolCall.name, args: toolCall.args, callId: toolCall.id })
 
   let result: ToolResult
+  const toolStartedAt = Date.now()
   try {
     result = await withTimeout(deps.toolRegistry.execute(toolCall), tool.timeout ?? 30000)
   } catch (err: unknown) {
     const errMsg = err instanceof Error ? err.message : String(err)
-    events.push({ type: 'tool_error', tool: toolCall.name, error: errMsg })
+    events.push({
+      type: 'tool_error',
+      tool: toolCall.name,
+      error: errMsg,
+      callId: toolCall.id,
+      latencyMs: Date.now() - toolStartedAt,
+    })
     return {
       events,
       message: {
@@ -262,6 +292,7 @@ async function executeToolCall(
       },
     }
   }
+  const toolLatencyMs = Date.now() - toolStartedAt
 
   // ask_user is a special sentinel — yield and let caller inject the answer
   if (result.result.startsWith('__ASK_USER__:')) {
@@ -323,9 +354,21 @@ async function executeToolCall(
   }
 
   if (result.error) {
-    events.push({ type: 'tool_error', tool: toolCall.name, error: resultContent })
+    events.push({
+      type: 'tool_error',
+      tool: toolCall.name,
+      error: resultContent,
+      callId: toolCall.id,
+      latencyMs: toolLatencyMs,
+    })
   } else {
-    events.push({ type: 'tool_result', tool: toolCall.name, result: resultContent })
+    events.push({
+      type: 'tool_result',
+      tool: toolCall.name,
+      result: resultContent,
+      callId: toolCall.id,
+      latencyMs: toolLatencyMs,
+    })
   }
 
   return {
@@ -408,6 +451,7 @@ export async function* agentLoop(
     yield { type: 'thinking_start' }
 
     let response
+    const generateStartedAt = Date.now()
     try {
       let contextMessages: Message[] = [
         { role: 'system', content: deps.systemPrompt },
@@ -419,13 +463,30 @@ export async function* agentLoop(
         if (modified) contextMessages = modified
       }
 
+      const toolsForRequest = deps.toolLoader
+        ? deps.toolLoader.selectTools(userMessage, deps.provider.capabilities)
+        : deps.toolRegistry.list()
+
+      // Token decomposition — emitted BEFORE the network call so tracing can
+      // see exactly how the input budget is split. This is the answer to
+      // "where are my tokens going" questions.
+      const systemTokens = estimateTokens(deps.systemPrompt)
+      const messagesTokens = estimateMessagesTokens(messages)
+      const toolsTokens = estimateToolsTokens(toolsForRequest)
+      yield {
+        type: 'request_prepared',
+        model: (deps.provider as { name?: string }).name || 'unknown',
+        provider: (deps.provider as { type?: string }).type || 'unknown',
+        systemTokens,
+        messagesTokens,
+        toolsTokens,
+        messagesCount: messages.length,
+        toolsCount: toolsForRequest.length,
+        totalInputTokensEstimate: systemTokens + messagesTokens + toolsTokens,
+      }
+
       response = await deps.provider.generate(
-        {
-          messages: contextMessages,
-          tools: deps.toolLoader
-            ? deps.toolLoader.selectTools(userMessage, deps.provider.capabilities)
-            : deps.toolRegistry.list(),
-        },
+        { messages: contextMessages, tools: toolsForRequest },
         { signal }
       )
 
@@ -479,7 +540,26 @@ export async function* agentLoop(
       break
     }
 
-    yield { type: 'thinking_end', tokens: response.usage }
+    const generateLatencyMs = Date.now() - generateStartedAt
+    yield {
+      type: 'thinking_end',
+      tokens: response.usage,
+      model: response.model,
+      provider: (deps.provider as { type?: string }).type,
+      finishReason: response.finishReason,
+      retryCount: response.retryCount,
+      generationId: response.generationId,
+      latencyMs: generateLatencyMs,
+      transport: response.transport,
+    }
+
+    // The generationId is included in `thinking_end` above. Authoritative
+    // billing details (cost, cached tokens, provider) are looked up
+    // asynchronously by a higher-level enricher (see GenerationEnricher in
+    // @teya/tracing) — we don't block the agent loop on a follow-up HTTP call,
+    // because OpenRouter's /generation endpoint takes 2-5s to surface fresh
+    // ids. The enricher emits a synthetic `generation_details` event into
+    // the tracer when it resolves.
 
     // ── 2. No tool calls — emit response and stop ────────────────────────────
 
@@ -593,9 +673,14 @@ export async function* agentLoop(
     const currentTokens = estimateMessagesTokens(messages)
     if (currentTokens > budget.condenserThreshold) {
       const condensed = await condenseMessagesAsync(messages, budget.effectiveBudget, summarizer)
-      const afterTokens = estimateMessagesTokens(condensed)
-      yield { type: 'context_compacted', before: currentTokens, after: afterTokens }
-      messages = condensed
+      const afterTokens = estimateMessagesTokens(condensed.messages)
+      yield {
+        type: 'context_compacted',
+        before: currentTokens,
+        after: afterTokens,
+        phase: condensed.phase,
+      }
+      messages = condensed.messages
     }
 
     // Continue loop — LLM will see tool results and decide the next step
