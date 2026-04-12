@@ -3,9 +3,11 @@
  */
 export { SessionStore } from './sessions.js'
 export { KnowledgeGraph } from './knowledge.js'
+export { KnowledgeGraphRegistry } from './kg-registry.js'
 export { createMemoryTools } from './tools.js'
 export type { Entity, Fact, Relation } from './knowledge.js'
 export { AssetStore } from './assets.js'
+export { AssetStoreRegistry } from './asset-registry.js'
 export type { Asset } from './assets.js'
 export { createAssetTools } from './asset-tools.js'
 export { ollamaEmbeddings, openaiEmbeddings, cosineSimilarity } from './embeddings.js'

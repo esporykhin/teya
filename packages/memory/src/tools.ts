@@ -8,10 +8,44 @@
  *   entities — list known entities
  *   relate  — create relation between entities
  *   update  — supersede an old fact with a new one
+ *
+ * Memory is per-identity. The owner has one knowledge graph; each guest
+ * has their own. Selection happens automatically via the identity context
+ * carried in AsyncLocalStorage. The tool itself doesn't know about scopes
+ * — it just calls registry.for(currentScopeId).
  */
 import type { KnowledgeGraph } from './knowledge.js'
+import type { KnowledgeGraphRegistry } from './kg-registry.js'
+import { getCurrentIdentity } from '@teya/core'
 
-export function createMemoryTools(kg: KnowledgeGraph) {
+/**
+ * Create memory tools backed by either a single KG (legacy / single-tenant)
+ * or a per-scope registry (multi-identity / sandbox mode).
+ */
+export function createMemoryTools(source: KnowledgeGraph | KnowledgeGraphRegistry) {
+  // Helper that returns the active KG for the current identity. When called
+  // with a singleton KG (legacy callers), always returns that one. When
+  // called with a registry, looks up the scope from AsyncLocalStorage.
+  function activeKg(): KnowledgeGraph {
+    if ('for' in source && typeof source.for === 'function') {
+      const id = getCurrentIdentity()
+      return source.for(id?.scopeId || 'owner')
+    }
+    return source as KnowledgeGraph
+  }
+
+  return _buildTools(activeKg)
+}
+
+function _buildTools(activeKg: () => KnowledgeGraph) {
+  const kgProxy = new Proxy({} as KnowledgeGraph, {
+    get(_t, prop) {
+      const target = activeKg() as unknown as Record<string | symbol, unknown>
+      const value = target[prop]
+      return typeof value === 'function' ? (value as Function).bind(target) : value
+    },
+  })
+  const kg = kgProxy
   const memoryTool = {
     name: 'core:memory',
     description: `Long-term memory — your persistent knowledge graph.

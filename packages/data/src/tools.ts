@@ -1,6 +1,23 @@
 import type { DataStore } from './data-store.js'
+import type { DataStoreRegistry } from './registry.js'
+import { getCurrentIdentity } from '@teya/core'
 
-export function createDataTools(store: DataStore) {
+export function createDataTools(source: DataStore | DataStoreRegistry) {
+  function activeStore(): DataStore {
+    if ('for' in source && typeof source.for === 'function') {
+      const id = getCurrentIdentity()
+      return source.for(id?.scopeId || 'owner')
+    }
+    return source as DataStore
+  }
+  // Lazy proxy: every method/property goes through the active scope.
+  const store = new Proxy({} as DataStore, {
+    get(_t, prop) {
+      const target = activeStore() as unknown as Record<string | symbol, unknown>
+      const value = target[prop]
+      return typeof value === 'function' ? (value as Function).bind(target) : value
+    },
+  })
   const dataTool = {
     name: 'core:data',
     description: `Dynamic SQLite database. Create tables, store and query structured data.

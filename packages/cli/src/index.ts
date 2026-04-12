@@ -8,13 +8,13 @@ import { readFile, writeFile, mkdir } from 'fs/promises'
 import { join } from 'path'
 import { agentLoop, buildSystemPrompt } from '@teya/core'
 import { loadSkills, buildSkillsMetadata, buildActiveSkillContent, buildVerifiedSkillsCatalog } from '@teya/skills'
-import type { Message, LLMProvider } from '@teya/core'
+import type { Message, LLMProvider, MessageContext } from '@teya/core'
 import { openrouter, ollama, codex, withToolAdapter, fallback } from '@teya/providers'
 import { createToolRegistry, registerBuiltins, createMCPManager, createDynamicToolLoader, closeBrowser, initWorkspace, getWorkspaceInfo } from '@teya/tools'
 import { AgentRegistry, createDelegateTool } from '@teya/orchestrator'
 import { CLITransport } from '@teya/transport-cli'
 import { TelegramTransport, TelegramUserbotTransport, createTelegramTool } from '@teya/transport-telegram'
-import { SessionStore, KnowledgeGraph, createMemoryTools, AssetStore, createAssetTools, ollamaEmbeddings } from '@teya/memory'
+import { SessionStore, KnowledgeGraphRegistry, createMemoryTools, AssetStoreRegistry, createAssetTools, ollamaEmbeddings } from '@teya/memory'
 import type { SessionState } from '@teya/core'
 import { AgentTracer, consoleExporter, jsonExporter, sessionFileExporter, compositeExporter, GenerationEnricher } from '@teya/tracing'
 import { TaskStore, createTaskTools, ensureSchedulerRunning } from '@teya/scheduler'
@@ -24,7 +24,13 @@ import {
   stop as stopProcess,
   restartAll as restartAllProcesses,
 } from '@teya/runtime'
-import { DataStore, createDataTools } from '@teya/data'
+import { DataStoreRegistry, createDataTools } from '@teya/data'
+import {
+  runWithIdentity,
+  makeIdentityContext,
+  type Identity,
+  type IdentityContext,
+} from '@teya/core'
 
 const CONFIG_DIR = join(process.env.HOME || process.env.USERPROFILE || '.', '.teya')
 const CONFIG_FILE = join(CONFIG_DIR, 'config.json')
@@ -439,27 +445,35 @@ async function main() {
   } catch {
     // Ollama not available — keyword search only
   }
-  const kg = new KnowledgeGraph(undefined, embeddingProvider)
-  const memTools = createMemoryTools(kg)
-  toolRegistry.register(memTools.memoryTool)  // core:memory (read, write, search, entities, relate, update)
+  // Per-identity registries: each scope (owner / guest-tg-789 / etc) gets
+  // its own knowledge graph, asset store, and data store. Tools resolve
+  // the active store via AsyncLocalStorage on every call — no per-message
+  // re-registration. Filesystem-level isolation prevents cross-scope leaks.
+  const kgRegistry = new KnowledgeGraphRegistry(embeddingProvider)
+  const memTools = createMemoryTools(kgRegistry)
+  toolRegistry.register(memTools.memoryTool)  // core:memory
 
-  // Initialize asset store and register asset tools
-  const assetStore = new AssetStore()
-  const assetTools = createAssetTools(assetStore)
-  toolRegistry.register(assetTools.assetTool)  // core:assets (save, search, get)
+  const assetRegistry = new AssetStoreRegistry()
+  const assetTools = createAssetTools(assetRegistry)
+  toolRegistry.register(assetTools.assetTool)  // core:assets
 
-  // Initialize task store and register task tools
+  // Tasks/scheduler stay single-instance — they're owner-only by permission
+  // engine fence (guests cannot schedule background work on the host).
   const taskStore = new TaskStore()
   const taskTools = createTaskTools(taskStore)
-  toolRegistry.register(taskTools.tasksTool)     // core:tasks (create, list, update, get, delete)
-  toolRegistry.register(taskTools.scheduleTool)  // core:schedule (list, pause, resume, trigger, delete)
+  toolRegistry.register(taskTools.tasksTool)     // core:tasks
+  toolRegistry.register(taskTools.scheduleTool)  // core:schedule
 
-  // Initialize data store and register data tools
-  const dataStore = new DataStore(join(CONFIG_DIR, 'data.db'), 'teya')
-  const dataTools = createDataTools(dataStore)
-  toolRegistry.register(dataTools.dataTool)      // core:data (create_table, insert, upsert, list, schema, sql, ...)
+  const dataRegistry = new DataStoreRegistry('teya')
+  const dataTools = createDataTools(dataRegistry)
+  toolRegistry.register(dataTools.dataTool)      // core:data
 
-  process.on('exit', () => { kg.close(); assetStore.close(); taskStore.close(); dataStore.close() })
+  process.on('exit', () => {
+    kgRegistry.closeAll()
+    assetRegistry.closeAll()
+    taskStore.close()
+    dataRegistry.closeAll()
+  })
 
   // Connect MCP server if --mcp flag is provided
   const mcpManager = createMCPManager()
@@ -572,6 +586,61 @@ async function main() {
     }
     routes.set(key, state)
     return state
+  }
+
+  /**
+   * Resolve who the current message comes from. CLI = always owner;
+   * Telegram = check the sender's user id against the saved owner mapping
+   * and either upgrade to owner or treat as a sandboxed guest.
+   *
+   * Owner mapping lives in ~/.teya/config.json under owner.telegramUserId
+   * (set with --owner-telegram-id or by editing the file).
+   */
+  function resolveIdentity(ctx: MessageContext): IdentityContext {
+    if (transportType === 'cli') {
+      return makeIdentityContext({ kind: 'owner', label: 'admin' })
+    }
+    if (!ctx.sender) {
+      // Telegram channels don't expose a sender — treat as anonymous.
+      return makeIdentityContext({ kind: 'anonymous' })
+    }
+    const ownerTgId = (saved as Record<string, string>).ownerTelegramUserId || process.env.TEYA_OWNER_TG_ID
+    if (ownerTgId && ctx.sender.id === ownerTgId) {
+      return makeIdentityContext({ kind: 'owner', label: 'admin' })
+    }
+    const identity: Identity = {
+      kind: 'guest',
+      userId: ctx.sender.id,
+      displayName: ctx.sender.displayName,
+      username: ctx.sender.username,
+      transport: transportType,
+    }
+    return makeIdentityContext(identity)
+  }
+
+  /**
+   * On the first message from a new identity, write a starter person
+   * entity into THEIR memory so Teya immediately "knows" who she's
+   * talking to. Idempotent — only fires when the entity doesn't exist.
+   */
+  function rememberIdentityIfNew(idCtx: IdentityContext, ctx: MessageContext): void {
+    if (idCtx.identity.kind !== 'guest') return
+    if (!ctx.sender) return
+    try {
+      const kg = kgRegistry.for(idCtx.scopeId)
+      const entityName = ctx.sender.displayName || ctx.sender.username || `tg-${ctx.sender.id}`
+      const existing = kg.getEntity(entityName)
+      if (existing) return
+      const entityId = kg.addEntity(entityName, 'person')
+      const facts: string[] = []
+      facts.push(`${entityName} is a Telegram user (id: ${ctx.sender.id}) who reached out via Teya's bot.`)
+      if (ctx.sender.username) facts.push(`${entityName}'s Telegram username is @${ctx.sender.username}.`)
+      if (ctx.chat?.title) facts.push(`First seen in chat "${ctx.chat.title}".`)
+      // Fire-and-forget — addFact is async because of embeddings.
+      Promise.all(facts.map(f => kg.addFact(entityId, f, ['auto', 'first-contact']))).catch(() => {})
+    } catch {
+      // Memory write failures must not block the conversation.
+    }
   }
 
   // Bootstrap: resume the latest session for CLI mode (Telegram mode loads
@@ -801,10 +870,12 @@ async function main() {
 
         case '/memory': {
           try {
-            const entities = kg.listEntities()
+            // CLI command always views the OWNER scope's memory.
+            const ownerKg = kgRegistry.for('owner')
+            const entities = ownerKg.listEntities()
             console.log(`\nMemory: ${entities.length} entities`)
             for (const e of entities.slice(0, 5)) {
-              const facts = kg.getEntityFacts(e.id)
+              const facts = ownerKg.getEntityFacts(e.id)
               console.log(`  ${e.name} (${e.type}): ${facts.length} facts`)
             }
             if (entities.length > 5) console.log(`  ... and ${entities.length - 5} more`)
@@ -848,7 +919,7 @@ async function main() {
 
               console.log('\n\x1b[90mRestarting self...\x1b[0m\n')
               // Close databases before restart
-              kg.close(); assetStore.close(); taskStore.close(); dataStore.close()
+              kgRegistry.closeAll(); assetRegistry.closeAll(); taskStore.close(); dataRegistry.closeAll()
               await mcpManager.disconnectAll()
               await closeBrowser()
               restartProcess(result.entryPoint)
@@ -871,135 +942,168 @@ async function main() {
     abortController = new AbortController()
     const routeKey = isBackgroundProcess ? ctx.sessionId : undefined
 
-    // Slash command intercept — works for ALL transports (Telegram included).
-    // Without this, /clear typed in Telegram goes to the LLM as a normal
-    // message and the per-route history keeps growing forever.
-    const trimmed = message.trim()
-    if (trimmed.startsWith('/')) {
-      const cmd = trimmed.split(/\s+/)[0]
-      if (cmd === '/clear' || cmd === '/new') {
-        const fresh = await resetRoute(routeKey)
-        const note = `New session ${fresh.session.id.slice(0, 8)}.`
-        if (isTelegramAny) transport.send({ type: 'response', content: note }, ctx.sessionId)
-        else { console.clear(); console.log('\x1b[1mTeya\x1b[0m'); console.log(`\x1b[90m${note}\x1b[0m\n`); (transport as CLITransport).prompt() }
-        return
-      }
-      if (cmd === '/compact') {
-        const cur = await getOrLoadRoute(routeKey)
-        cur.history = []
-        cur.session = { ...cur.session, messages: [] }
-        await sessionStore.save(cur.session)
-        const note = 'Context cleared. Session preserved.'
-        if (isTelegramAny) transport.send({ type: 'response', content: note }, ctx.sessionId)
-        else { console.log(`\x1b[90m${note}\x1b[0m\n`); (transport as CLITransport).prompt() }
-        return
-      }
-      if (cmd === '/status') {
-        const cur = await getOrLoadRoute(routeKey)
-        const tokens = Math.ceil(cur.history.reduce((s, m) => s + (m.content?.length || 0), 0) / 3.5)
-        const note = `session=${cur.session.id.slice(0, 8)} messages=${cur.history.length} ~tokens=${tokens} turns=${cur.session.totalTurns} cost=$${(cur.session.totalCost || 0).toFixed(4)}`
-        if (isTelegramAny) transport.send({ type: 'response', content: note }, ctx.sessionId)
-        else { console.log(`\x1b[90m${note}\x1b[0m\n`); (transport as CLITransport).prompt() }
-        return
-      }
-    }
+    // Resolve identity FIRST — every downstream operation (memory, files,
+    // permissions, system prompt) is identity-scoped. We then run the rest
+    // of the handler inside runWithIdentity so AsyncLocalStorage carries
+    // the identity through awaits and tool executions.
+    const idCtx = resolveIdentity(ctx)
 
-    // Resolve the route — this is the per-topic / per-author isolated state.
-    const route = await getOrLoadRoute(routeKey)
-
-    // Vision model auto-switch when images are attached
-    let activeProvider = provider
-    const images = ctx.images
-    if (images && images.length > 0) {
-      const visionMap: Record<string, string> = {
-        'z-ai/glm-5-turbo': 'z-ai/glm-5v-turbo',
-        'z-ai/glm-5': 'z-ai/glm-5v-turbo',
-        'z-ai/glm-4.6': 'z-ai/glm-4.6v',
-        'z-ai/glm-4.5': 'z-ai/glm-4.5v',
+    await runWithIdentity(idCtx, async () => {
+      // Slash command intercept — works for ALL transports.
+      const trimmed = message.trim()
+      if (trimmed.startsWith('/')) {
+        const cmd = trimmed.split(/\s+/)[0]
+        if (cmd === '/clear' || cmd === '/new') {
+          const fresh = await resetRoute(routeKey)
+          const note = `New session ${fresh.session.id.slice(0, 8)}.`
+          if (isTelegramAny) transport.send({ type: 'response', content: note }, ctx.sessionId)
+          else { console.clear(); console.log('\x1b[1mTeya\x1b[0m'); console.log(`\x1b[90m${note}\x1b[0m\n`); (transport as CLITransport).prompt() }
+          return
+        }
+        if (cmd === '/compact') {
+          const cur = await getOrLoadRoute(routeKey)
+          cur.history = []
+          cur.session = { ...cur.session, messages: [] }
+          await sessionStore.save(cur.session)
+          const note = 'Context cleared. Session preserved.'
+          if (isTelegramAny) transport.send({ type: 'response', content: note }, ctx.sessionId)
+          else { console.log(`\x1b[90m${note}\x1b[0m\n`); (transport as CLITransport).prompt() }
+          return
+        }
+        if (cmd === '/status') {
+          const cur = await getOrLoadRoute(routeKey)
+          const tokens = Math.ceil(cur.history.reduce((s, m) => s + (m.content?.length || 0), 0) / 3.5)
+          const note = `session=${cur.session.id.slice(0, 8)} messages=${cur.history.length} ~tokens=${tokens} turns=${cur.session.totalTurns} cost=$${(cur.session.totalCost || 0).toFixed(4)} identity=${idCtx.identity.kind}/${idCtx.scopeId}`
+          if (isTelegramAny) transport.send({ type: 'response', content: note }, ctx.sessionId)
+          else { console.log(`\x1b[90m${note}\x1b[0m\n`); (transport as CLITransport).prompt() }
+          return
+        }
       }
-      const visionModel = visionMap[model] || 'google/gemini-2.5-flash-preview-05-20'
-      if (visionModel !== model) {
-        console.log(`\x1b[90m  Vision: ${visionModel}\x1b[0m`)
-        activeProvider = openrouter({ model: visionModel, apiKey })
+
+      // Auto-record the person on first contact (guests only).
+      rememberIdentityIfNew(idCtx, ctx)
+
+      // Resolve the route — per-topic / per-author isolated session state.
+      const route = await getOrLoadRoute(routeKey)
+
+      // Vision model auto-switch when images are attached
+      let activeProvider = provider
+      const images = ctx.images
+      if (images && images.length > 0) {
+        const visionMap: Record<string, string> = {
+          'z-ai/glm-5-turbo': 'z-ai/glm-5v-turbo',
+          'z-ai/glm-5': 'z-ai/glm-5v-turbo',
+          'z-ai/glm-4.6': 'z-ai/glm-4.6v',
+          'z-ai/glm-4.5': 'z-ai/glm-4.5v',
+        }
+        const visionModel = visionMap[model] || 'google/gemini-2.5-flash-preview-05-20'
+        if (visionModel !== model) {
+          console.log(`\x1b[90m  Vision: ${visionModel}\x1b[0m`)
+          activeProvider = openrouter({ model: visionModel, apiKey })
+        }
       }
-    }
 
-    // In groups, prefix the message with sender attribution so the LLM
-    // can distinguish authors in multi-user threads. In private chats /
-    // CLI, message is left untouched.
-    let effectiveMessage = message
-    if (ctx.sender && ctx.chat && ctx.chat.kind !== 'private' && ctx.chat.kind !== 'cli') {
-      const author = ctx.sender.displayName || (ctx.sender.username && '@' + ctx.sender.username) || `user-${ctx.sender.id}`
-      effectiveMessage = `[from: ${author}] ${message}`
-    }
+      // In groups, prefix the message with sender attribution so the LLM
+      // can distinguish authors in multi-user threads. In private chats /
+      // CLI, message is left untouched.
+      let effectiveMessage = message
+      if (ctx.sender && ctx.chat && ctx.chat.kind !== 'private' && ctx.chat.kind !== 'cli') {
+        const author = ctx.sender.displayName || (ctx.sender.username && '@' + ctx.sender.username) || `user-${ctx.sender.id}`
+        effectiveMessage = `[from: ${author}] ${message}`
+      }
 
-    // Stamp per-message trace context: route, sender, chat metadata.
-    tracer?.setContext({
-      sessionId: route.session.id,
-      agentId: route.session.agentId || 'default',
-      transport: transportType,
-      userMessage: message.slice(0, 500),
+      // Compose an identity-aware system prompt. Owner gets the standard
+      // promot; guests get a sandboxed-mode preamble explicitly telling
+      // the model "you are not the owner, isolate per-user, never leak
+      // owner data". The base systemPrompt + getWorkspaceInfo() add the
+      // current scope's workspace path automatically (workspace.ts is
+      // identity-aware).
+      const guestPreamble = idCtx.identity.kind === 'guest'
+        ? `\n\n## Identity & Privacy
+You are talking to ${ctx.sender?.displayName || 'a user'} via Telegram (id: ${ctx.sender?.id}).
+This user is NOT the administrator. They are a sandboxed guest.
+
+Rules:
+- All memory you write is stored in THIS user's private knowledge graph.
+- Never share information about the administrator or other users.
+- Never reference projects, plans, or facts that belong to the administrator.
+- You have a personal workspace for this user where you can read/write files.
+- You cannot execute shell commands or access the host machine.
+- Help them with their own questions, projects, and creative work.\n`
+        : ''
+      const ownerPreamble = idCtx.identity.kind === 'owner' && transportType !== 'cli' && ctx.sender
+        ? `\n\n## Identity\nYou are talking to your administrator (${ctx.sender.displayName || ctx.sender.username || ctx.sender.id}) via Telegram. Full trust.\n`
+        : ''
+      const effectiveSystemPrompt = systemPrompt + guestPreamble + ownerPreamble + '\n\n' + getWorkspaceInfo()
+
+      // Stamp per-message trace context.
+      tracer?.setContext({
+        sessionId: route.session.id,
+        agentId: route.session.agentId || 'default',
+        transport: transportType,
+        userMessage: message.slice(0, 500),
+      })
+
+      try {
+        const events = agentLoop(
+          {
+            provider: activeProvider,
+            toolRegistry,
+            toolLoader,
+            systemPrompt: effectiveSystemPrompt,
+            config: { maxTurns: 50, maxCostPerSession: 5 },
+            hooks: {},
+          },
+          effectiveMessage,
+          route.history,
+          abortController?.signal,
+          images,
+        )
+
+        for await (const event of events) {
+          tracer?.processEvent(event)
+
+          if (event.type === 'thinking_end' && event.generationId && enricher) {
+            enricher.enqueue(event.generationId, tracer!.getContext())
+          }
+
+          if (event.type === 'tool_start') {
+            route.toolsUsed.add(event.tool)
+            if (event.tool === 'core:task_create' || event.tool === 'core:task_update') {
+              const taskId = (event.args as any)?.id
+              if (taskId) route.taskIds.add(taskId)
+            }
+            if (event.tool === 'core:delegate') {
+              const agentId = (event.args as any)?.agent
+              if (agentId && agentId !== 'list') route.agentsUsed.add(agentId)
+            }
+          }
+
+          if (event.type === 'messages_updated') {
+            route.history = [...event.messages]
+            route.session = {
+              ...route.session,
+              messages: route.history,
+              updatedAt: new Date(),
+              totalTurns: route.session.totalTurns + 1,
+              totalCost: tracer?.getSessionCost() || route.session.totalCost,
+              toolsUsed: [...route.toolsUsed],
+              agentsUsed: [...route.agentsUsed],
+              taskIds: [...route.taskIds],
+            }
+            await sessionStore.save(route.session)
+          } else {
+            transport.send(event, ctx.sessionId)
+          }
+        }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err)
+        console.error(`\nFatal error: ${msg}`)
+      } finally {
+        abortController = null
+        if (!isTelegramAny) (transport as CLITransport).prompt()
+      }
     })
-
-    try {
-      const events = agentLoop(
-        {
-          provider: activeProvider,
-          toolRegistry,
-          toolLoader,
-          systemPrompt,
-          config: { maxTurns: 50, maxCostPerSession: 5 },
-          hooks: {},
-        },
-        effectiveMessage,
-        route.history,
-        abortController.signal,
-        images,
-      )
-
-      for await (const event of events) {
-        tracer?.processEvent(event)
-
-        if (event.type === 'thinking_end' && event.generationId && enricher) {
-          enricher.enqueue(event.generationId, tracer!.getContext())
-        }
-
-        if (event.type === 'tool_start') {
-          route.toolsUsed.add(event.tool)
-          if (event.tool === 'core:task_create' || event.tool === 'core:task_update') {
-            const taskId = (event.args as any)?.id
-            if (taskId) route.taskIds.add(taskId)
-          }
-          if (event.tool === 'core:delegate') {
-            const agentId = (event.args as any)?.agent
-            if (agentId && agentId !== 'list') route.agentsUsed.add(agentId)
-          }
-        }
-
-        if (event.type === 'messages_updated') {
-          route.history = [...event.messages]
-          route.session = {
-            ...route.session,
-            messages: route.history,
-            updatedAt: new Date(),
-            totalTurns: route.session.totalTurns + 1,
-            totalCost: tracer?.getSessionCost() || route.session.totalCost,
-            toolsUsed: [...route.toolsUsed],
-            agentsUsed: [...route.agentsUsed],
-            taskIds: [...route.taskIds],
-          }
-          await sessionStore.save(route.session)
-        } else {
-          transport.send(event, ctx.sessionId)
-        }
-      }
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err)
-      console.error(`\nFatal error: ${msg}`)
-    } finally {
-      abortController = null
-      if (!isTelegramAny) (transport as CLITransport).prompt()
-    }
   })
 
   transport.onCancel((_sessionId) => {

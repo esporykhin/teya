@@ -3,6 +3,7 @@
  * @exports PermissionEngine, sanitizeExternalResult, checkDLP
  */
 import type { ToolCall } from './types.js'
+import { getCurrentIdentity } from './identity.js'
 
 // ─── Permission Engine ────────────────────────────────────────────────────────
 
@@ -16,21 +17,94 @@ export interface PermissionRule {
 export interface PermissionConfig {
   mode: PermissionMode
   rules?: PermissionRule[]
+  /**
+   * Tools that NON-OWNER identities (guests, anonymous) are permitted to call.
+   * Glob patterns. Anything not matching is denied for guests regardless of
+   * the base mode. Owner identity bypasses this list entirely.
+   *
+   * Default safelist (see GUEST_SAFE_TOOLS below) covers read-only and
+   * memory operations. Dangerous tools (shell, files, scheduler, exec) are
+   * NOT on it — guests literally cannot run them on the host machine.
+   */
+  guestSafeTools?: string[]
 }
 
 export type PermissionResult = 'allow' | 'deny' | 'ask'
 
+/**
+ * Default safelist of tools a guest identity may invoke. Curated so a
+ * guest gets a fully functional Teya inside their personal sandbox while
+ * being unable to harm the host or read owner data:
+ *
+ *   ALLOWED — sandbox-bound tools:
+ *   - core:memory       → guest's own knowledge graph (per-scope file)
+ *   - core:files        → reads/writes inside the GUEST's workspace dir;
+ *                         resolveWorkspacePath is identity-aware and
+ *                         blocks any path outside the guest sandbox
+ *   - core:assets       → guest's own asset store (per-scope file)
+ *   - core:data         → guest's own SQLite (per-scope file)
+ *   - core:think/plan   → pure cognition, no side effects
+ *   - core:web_*        → outbound HTTP for general info
+ *   - core:respond / ask_user / intermediate_response → conversational
+ *   - core:tool_search  → tool discovery
+ *
+ *   NOT ON THE LIST — would cross the sandbox:
+ *   - core:exec, core:shell           → host shell with no syscall isolation
+ *                                        (could rm host files, exfil secrets)
+ *   - core:tasks, core:schedule       → background work on owner's machine,
+ *                                        owner's resources, owner's bot
+ *   - core:browser_*                  → could hijack owner's logged-in
+ *                                        browser sessions
+ *   - core:email_send                 → would mail from the owner's account
+ *   - core:delegate                   → sub-agents currently inherit owner
+ *                                        permissions; would bypass the fence
+ *   - core:telegram                   → MTProto userbot acts as the owner
+ *   - All MCP tools                   → unknown attack surface, opt-in only
+ */
+export const GUEST_SAFE_TOOLS = [
+  // Cognition / chat
+  'core:think',
+  'core:plan',
+  'core:respond',
+  'core:ask_user',
+  'core:tool_search',
+  // Per-scope storage (identity-aware, can't escape sandbox)
+  'core:memory',
+  'core:files',
+  'core:assets',
+  'core:data',
+  // Outbound HTTP (read-only network)
+  'core:web_search',
+  'core:web_fetch',
+  'core:web',
+  'core:http_request',
+]
+
 export class PermissionEngine {
   private mode: PermissionMode
   private rules: PermissionRule[]
+  private guestSafeTools: string[]
 
   constructor(config?: PermissionConfig) {
     this.mode = config?.mode || 'allow-all'
     this.rules = config?.rules || []
+    this.guestSafeTools = config?.guestSafeTools || GUEST_SAFE_TOOLS
   }
 
   check(call: ToolCall, toolCost?: { sideEffects?: boolean }): PermissionResult {
-    // 1. Check explicit rules first
+    // 0. Identity-based hard fence — runs BEFORE rules and mode so it
+    //    can't be bypassed by misconfiguration. If the current call is
+    //    NOT owner-trusted, only tools on the guest safelist are allowed.
+    //    This is the safety net that protects the host from a stranger
+    //    walking up and asking Teya to "rm -rf my files".
+    const identity = getCurrentIdentity()
+    if (identity && !identity.isOwner) {
+      const onSafeList = this.guestSafeTools.some(p => this.matchPattern(p, call.name))
+      if (!onSafeList) return 'deny'
+      // Even safe tools may have rules-based overrides applied below.
+    }
+
+    // 1. Check explicit rules
     for (const rule of this.rules) {
       if (this.matchPattern(rule.tool, call.name)) {
         return rule.action
@@ -42,10 +116,8 @@ export class PermissionEngine {
       case 'allow-all': return 'allow'
       case 'deny-all': return 'deny'
       case 'ask':
-        // Only ask for tools with side effects
         return toolCost?.sideEffects ? 'ask' : 'allow'
       case 'rules':
-        // Rules mode: if no rule matched, deny
         return 'deny'
     }
   }

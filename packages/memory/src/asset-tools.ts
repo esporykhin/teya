@@ -7,8 +7,27 @@
  *   get    — get asset details by ID
  */
 import type { AssetStore } from './assets.js'
+import type { AssetStoreRegistry } from './asset-registry.js'
+import { getCurrentIdentity } from '@teya/core'
 
-export function createAssetTools(store: AssetStore) {
+export function createAssetTools(source: AssetStore | AssetStoreRegistry) {
+  function activeStore(): AssetStore {
+    if ('for' in source && typeof source.for === 'function') {
+      const id = getCurrentIdentity()
+      return source.for(id?.scopeId || 'owner')
+    }
+    return source as AssetStore
+  }
+  // Lazy-resolving proxy: every method/property access goes through the
+  // current identity. This keeps the rest of the tool body identical to
+  // the legacy single-store version.
+  const store = new Proxy({} as AssetStore, {
+    get(_t, prop) {
+      const target = activeStore() as unknown as Record<string | symbol, unknown>
+      const value = target[prop]
+      return typeof value === 'function' ? (value as Function).bind(target) : value
+    },
+  })
   const assetTool = {
     name: 'core:assets',
     description: `File/document store. Actions:
