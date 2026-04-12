@@ -49,12 +49,24 @@ export class CronEngine {
       if (this.running.has(task.id)) continue
       if (this.running.size >= this.maxConcurrent) break
 
+      // Manual trigger override: when something (e.g. core:schedule(trigger))
+      // sets status=pending and due_at in the past on a cron task, run it
+      // immediately regardless of the cron expression. Without this, manually
+      // triggered cron tasks sit in pending forever — the cron clock won't
+      // re-fire them until their next scheduled slot.
+      const isManualTrigger =
+        task.status === 'pending' && task.dueAt && new Date(task.dueAt).getTime() <= now.getTime()
+      if (isManualTrigger) {
+        this.dispatch(task)
+        continue
+      }
+
       if (isCronDueInTimezone(task.cron!, task.timezone, task.lastRunAt, now)) {
         this.dispatch(task)
       }
     }
 
-    // One-off due tasks
+    // One-off due tasks (cron IS NULL)
     const dueOneOff = this.store.getDueOneOffTasks()
     for (const task of dueOneOff) {
       if (this.running.has(task.id)) continue
