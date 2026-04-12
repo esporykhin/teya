@@ -69,7 +69,8 @@ export interface UpdateTaskInput {
   status?: TaskStatus
   priority?: TaskPriority
   assignee?: string
-  dueAt?: string
+  /** Pass null to clear the field (used by manual-trigger override). */
+  dueAt?: string | null
   cron?: string
   prompt?: string
   result?: string

@@ -23,6 +23,7 @@
     "@teya/orchestrator": "workspace:*",
     "@teya/memory": "workspace:*",
     "@teya/runtime": "workspace:*",
+    "@teya/tracing": "workspace:*",
     "better-sqlite3": "^12.8.0"
   },
   "devDependencies": {

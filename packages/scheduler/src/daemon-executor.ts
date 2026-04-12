@@ -4,13 +4,16 @@
  * Each task gets its own: provider instance, tool registry, system prompt.
  * Supports multi-agent dispatch via AgentRegistry.
  */
-import { agentLoop, buildSystemPrompt } from '@teya/core'
-import type { AgentEvent, LLMProvider } from '@teya/core'
+import { agentLoop, buildSystemPrompt, runWithSession } from '@teya/core'
+import type { AgentEvent, LLMProvider, ToolResultEntry } from '@teya/core'
 import { openrouter, ollama, withToolAdapter } from '@teya/providers'
 import { createToolRegistry, registerBuiltins, initWorkspace, getWorkspaceInfo } from '@teya/tools'
 import { AgentRegistry, type AgentDef } from '@teya/orchestrator'
 import { KnowledgeGraph, createMemoryTools } from '@teya/memory'
+import { AgentTracer, jsonExporter, sessionFileExporter, compositeExporter, GenerationEnricher, type AgentTracer as AgentTracerType } from '@teya/tracing'
 import { randomUUID } from 'crypto'
+import { join } from 'path'
+import { homedir } from 'os'
 import type { TaskStore, Task } from './task-store.js'
 import { createTaskTools } from './tools.js'
 import type { CronEngineExecutor } from './cron-engine.js'
@@ -138,9 +141,36 @@ export class DaemonExecutor implements CronEngineExecutor {
       }) + '\n\n' + getWorkspaceInfo()
         + `\n\nYou are executing a scheduled task. Task: "${task.title}"\nBe autonomous — complete the task and report the result concisely.`
 
-      // 5. Run agent loop
+      // 5. Tracing — every cron execution gets its own per-task session id
+      //    so `teya trace show cron-<task>-<exec>` works just like Telegram
+      //    sessions. The tracer writes both to today's daily aggregate AND
+      //    to the per-session jsonl, identical to the CLI setup.
+      const traceSessionId = `cron-${task.id}-${execId}`
+      const today = new Date().toISOString().slice(0, 10)
+      const tracesDir = join(homedir(), '.teya', 'traces')
+      const tracer = new AgentTracer(
+        compositeExporter(
+          jsonExporter(join(tracesDir, `${today}.jsonl`)),
+          sessionFileExporter(join(tracesDir, 'sessions')),
+        ),
+        { capabilities: provider.capabilities },
+      )
+      tracer.setContext({
+        sessionId: traceSessionId,
+        agentId: task.assignee || 'scheduler',
+        transport: 'cron',
+        userMessage: `[cron] ${task.title}`,
+      })
+      const enricher = provider.getGenerationDetails ? new GenerationEnricher(provider, tracer) : null
+
+      // Per-execution tool result store for sliding-window retrieval.
+      const toolResults = new Map<string, ToolResultEntry>()
+
+      // 6. Run agent loop inside identity-less, session-scoped wrapper.
+      //    Without runWithSession, the agent-loop's sliding-window pass and
+      //    core:tool_result_get builtin can't access the per-execution store.
       const prompt = task.prompt || task.description || task.title
-      const gen = agentLoop(
+      const gen = runWithSession({ sessionId: traceSessionId, toolResults }, () => agentLoop(
         {
           provider,
           toolRegistry,
@@ -151,9 +181,13 @@ export class DaemonExecutor implements CronEngineExecutor {
         prompt,
         [], // empty history — isolated session
         signal,
-      )
+      ))
 
       for await (const event of gen) {
+        tracer.processEvent(event)
+        if (event.type === 'thinking_end' && event.generationId && enricher) {
+          enricher.enqueue(event.generationId, tracer.getContext())
+        }
         if (event.type === 'response') {
           result = event.content
         }
@@ -162,6 +196,13 @@ export class DaemonExecutor implements CronEngineExecutor {
           totalOutputTokens += event.tokens.outputTokens
         }
       }
+
+      // Drain enricher and close session span before we move on.
+      if (enricher) {
+        await enricher.drain(30_000)
+        enricher.stop()
+      }
+      tracer.finishSession('exit')
 
       // 6. Success
       const costUsd = this.estimateCost(totalInputTokens, totalOutputTokens, provider)

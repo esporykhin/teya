@@ -54,9 +54,14 @@ export class CronEngine {
       // immediately regardless of the cron expression. Without this, manually
       // triggered cron tasks sit in pending forever — the cron clock won't
       // re-fire them until their next scheduled slot.
+      //
+      // CRITICAL: clear due_at BEFORE dispatch, otherwise this branch fires
+      // on every subsequent tick (the cron task's status is reset to pending
+      // after each run, and due_at is still in the past → infinite loop).
       const isManualTrigger =
         task.status === 'pending' && task.dueAt && new Date(task.dueAt).getTime() <= now.getTime()
       if (isManualTrigger) {
+        this.store.update(task.id, { dueAt: null })
         this.dispatch(task)
         continue
       }
