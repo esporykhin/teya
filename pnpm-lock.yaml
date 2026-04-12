@@ -35,6 +35,9 @@ importers:
       '@teya/providers':
         specifier: workspace:*
         version: link:../providers
+      '@teya/runtime':
+        specifier: workspace:*
+        version: link:../runtime
       '@teya/scheduler':
         specifier: workspace:*
         version: link:../scheduler
@@ -196,6 +199,18 @@ importers:
         specifier: ^5.9.0
         version: 5.9.3
 
+  packages/runtime:
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.19.17
+      tsup:
+        specifier: ^8.0.0
+        version: 8.5.1(postcss@8.5.8)(typescript@5.9.3)
+      typescript:
+        specifier: ^5.9.0
+        version: 5.9.3
+
   packages/scheduler:
     dependencies:
       '@teya/core':
@@ -210,6 +225,9 @@ importers:
       '@teya/providers':
         specifier: workspace:*
         version: link:../providers
+      '@teya/runtime':
+        specifier: workspace:*
+        version: link:../runtime
       '@teya/tools':
         specifier: workspace:*
         version: link:../tools

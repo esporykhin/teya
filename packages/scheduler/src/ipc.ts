@@ -9,7 +9,6 @@ import { unlinkSync } from 'fs'
 import { join } from 'path'
 import type { TaskStore, ExecutionRecord } from './task-store.js'
 import type { CronEngine } from './cron-engine.js'
-import type { HealthManager } from './health.js'
 
 // ── Protocol ─────────────────────────────────────────────────────────────────
 
@@ -42,7 +41,6 @@ export interface DaemonStatus {
 export interface IPCServerDeps {
   store: TaskStore
   engine: CronEngine
-  health: HealthManager
   getAgentCount: () => number
   startTime: Date
 }

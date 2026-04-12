@@ -17,7 +17,13 @@ import { TelegramTransport, TelegramUserbotTransport, createTelegramTool } from 
 import { SessionStore, KnowledgeGraph, createMemoryTools, AssetStore, createAssetTools, ollamaEmbeddings } from '@teya/memory'
 import type { SessionState } from '@teya/core'
 import { AgentTracer, consoleExporter, jsonExporter, sessionFileExporter, compositeExporter, GenerationEnricher } from '@teya/tracing'
-import { TaskStore, createTaskTools, HealthManager } from '@teya/scheduler'
+import { TaskStore, createTaskTools, ensureSchedulerRunning } from '@teya/scheduler'
+import {
+  register as registerProcess,
+  list as listProcesses,
+  stop as stopProcess,
+  restartAll as restartAllProcesses,
+} from '@teya/runtime'
 import { DataStore, createDataTools } from '@teya/data'
 
 const CONFIG_DIR = join(process.env.HOME || process.env.USERPROFILE || '.', '.teya')
@@ -204,11 +210,11 @@ if (subcommand === 'trace') {
 }
 
 // Runtime registry — list / restart background teya processes.
+// All logic lives in @teya/runtime; this is just CLI UX.
 if (subcommand === 'runtime') {
   const action = process.argv[3] || 'list'
-  const { list: listProcs, stop: stopProc, restartAll } = await import('./runtime-registry.js')
   if (action === 'list' || action === 'ls') {
-    const procs = listProcs()
+    const procs = listProcesses()
     if (procs.length === 0) {
       console.log('No background teya processes registered.')
     } else {
@@ -216,23 +222,24 @@ if (subcommand === 'runtime') {
       for (const p of procs) {
         const age = Math.floor((Date.now() - new Date(p.startedAt).getTime()) / 1000)
         const ageStr = age < 60 ? `${age}s` : age < 3600 ? `${Math.floor(age / 60)}m` : `${Math.floor(age / 3600)}h`
-        console.log(`  ${p.id.padEnd(20)} pid=${String(p.pid).padEnd(7)} up=${ageStr.padEnd(6)} ${p.description}`)
+        const beat = Math.floor((Date.now() - new Date(p.lastHeartbeat).getTime()) / 1000)
+        console.log(`  ${p.id.padEnd(20)} pid=${String(p.pid).padEnd(7)} up=${ageStr.padEnd(6)} beat=${beat}s  ${p.description}`)
         console.log(`  ${' '.repeat(20)} log: ${p.logFile}`)
       }
     }
   } else if (action === 'stop') {
     const id = process.argv[4]
     if (!id) { console.error('Usage: teya runtime stop <id>'); process.exit(1) }
-    const ok = await stopProc(id)
+    const ok = await stopProcess(id)
     console.log(ok ? `Stopped ${id}` : `${id} was not running`)
   } else if (action === 'restart') {
-    const restarted = await restartAll({ log: (msg) => console.log(msg) })
+    const restarted = await restartAllProcesses({ log: (msg) => console.log(msg) })
     console.log(`\nRestarted ${restarted.length} process(es).`)
   } else {
     console.log(`teya runtime — manage background teya processes
 
 Commands:
-  list                List registered processes (default)
+  list                List registered processes with heartbeat age
   stop <id>           Gracefully stop one process
   restart             Restart all registered processes`)
   }
@@ -554,6 +561,9 @@ async function main() {
   let transport: CLITransport | TelegramTransport | TelegramUserbotTransport
   const transportKind = transportType as 'cli' | 'telegram' | 'telegram-userbot'
   const isTelegramAny = transportKind === 'telegram' || transportKind === 'telegram-userbot'
+  // True if this teya instance runs as a long-lived background process and
+  // should be tracked in @teya/runtime so `teya update` can restart it.
+  const isBackgroundProcess = isTelegramAny
 
   if (transportKind === 'telegram') {
     if (!telegramToken) {
@@ -561,9 +571,6 @@ async function main() {
       process.exit(1)
     }
     transport = new TelegramTransport({ token: telegramToken })
-    // Register so `teya update` can restart this background process after a build.
-    const { register: registerProcess } = await import('./runtime-registry.js')
-    registerProcess('telegram', 'Telegram bot (HTTP API)')
   } else if (transportKind === 'telegram-userbot') {
     const apiIdRaw = args['telegram-api-id'] || process.env.TELEGRAM_API_ID || saved.telegramApiId || ''
     const apiHash = args['telegram-api-hash'] || process.env.TELEGRAM_API_HASH || saved.telegramApiHash || ''
@@ -603,14 +610,24 @@ async function main() {
         console.log(`\x1b[32m[telegram-userbot] Session saved to ${CONFIG_FILE}\x1b[0m`)
       },
     })
-    const { register: registerProcess } = await import('./runtime-registry.js')
-    registerProcess('telegram-userbot', 'Telegram userbot (MTProto)')
   } else {
     transport = new CLITransport()
     // Pass agent list for @mention autocomplete
     ;(transport as CLITransport).setAgents(
       subAgents.map(a => ({ id: a.id, description: a.description }))
     )
+  }
+
+  // Register this process in the runtime registry if it's a background mode.
+  // Single point of registration — adding a new background transport later
+  // means updating isBackgroundProcess above, not scattering register() calls.
+  if (isBackgroundProcess) {
+    const description = transportKind === 'telegram'
+      ? 'Telegram bot (HTTP API)'
+      : transportKind === 'telegram-userbot'
+        ? 'Telegram userbot (MTProto)'
+        : `${transportKind} background process`
+    registerProcess(transportKind, description)
   }
 
   // When the userbot transport is active, give the agent full Telegram control
@@ -754,11 +771,10 @@ async function main() {
               // Restart any background teya processes (Telegram bot, scheduler).
               // They keep the OLD code in RAM until killed — without this, the
               // disk binary is fresh but the running bot serves stale code.
-              const { restartAll, list: listProcs } = await import('./runtime-registry.js')
-              const others = listProcs().filter(p => p.pid !== process.pid)
+              const others = listProcesses().filter(p => p.pid !== process.pid)
               if (others.length > 0) {
                 console.log(`\n\x1b[90mRestarting ${others.length} background process(es)...\x1b[0m`)
-                await restartAll({
+                await restartAllProcesses({
                   excludePid: process.pid,
                   log: (msg) => console.log(`\x1b[90m${msg}\x1b[0m`),
                 })
@@ -912,38 +928,17 @@ async function main() {
     abortController?.abort()
   })
 
-  // Auto-bootstrap the scheduler daemon. The scheduler runs as a separate
-  // detached process so cron tasks fire even when this teya CLI/Telegram
-  // process exits. Idempotent: ensureSchedulerRunning() returns the existing
-  // PID if already alive. Opt out with --no-scheduler.
+  // Auto-bootstrap the scheduler daemon. The daemon registers itself in
+  // @teya/runtime — no proxy registration from here. Idempotent: returns the
+  // existing PID if a healthy daemon is already running. Opt out with
+  // --no-scheduler. Skipped entirely when no cron tasks exist.
   const noScheduler = args['no-scheduler'] !== undefined
   const cronTasks = taskStore.listCronTasks()
   if (!noScheduler && cronTasks.length > 0) {
-    const { ensureSchedulerRunning } = await import('@teya/scheduler')
     const result = await ensureSchedulerRunning({ silent: true })
     if (result) {
       const tag = result.alreadyRunning ? 'attached' : 'started'
       console.log(`\x1b[90mScheduler: ${cronTasks.length} cron tasks, ${tag} (PID ${result.pid})\x1b[0m`)
-      // Register the daemon in the runtime registry on its behalf so
-      // `teya update` can restart it after a build. The daemon doesn't
-      // import @teya/cli so we write the entry from here.
-      if (!result.alreadyRunning) {
-        const { mkdirSync, writeFileSync } = await import('fs')
-        const runDir = join(process.env.HOME || '.', '.teya', 'run')
-        mkdirSync(runDir, { recursive: true })
-        writeFileSync(
-          join(runDir, 'scheduler.json'),
-          JSON.stringify({
-            id: 'scheduler',
-            pid: result.pid,
-            startedAt: new Date().toISOString(),
-            args: [result.daemonPath],
-            description: 'Scheduler daemon (cron tasks)',
-            logFile: join(process.env.HOME || '.', '.teya', 'logs', 'scheduler.stderr.log'),
-          }, null, 2),
-          'utf-8',
-        )
-      }
     } else {
       console.log(`\x1b[33mScheduler: ${cronTasks.length} cron tasks but daemon failed to start (~/.teya/logs/scheduler.stderr.log)\x1b[0m`)
     }

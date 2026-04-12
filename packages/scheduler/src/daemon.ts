@@ -20,12 +20,12 @@ import { TaskStore } from './task-store.js'
 import { CronEngine } from './cron-engine.js'
 import { DaemonExecutor } from './daemon-executor.js'
 import { IPCServer } from './ipc.js'
-import { HealthManager } from './health.js'
 import { ensureBuiltinTasks } from './builtin-tasks.js'
 import { AgentRegistry } from '@teya/orchestrator'
 import { KnowledgeGraph, SessionStore as MemSessionStore, batchSummarize, extractDailyKnowledge } from '@teya/memory'
 import { openrouter } from '@teya/providers'
 import { initWorkspace } from '@teya/tools'
+import { register as registerProcess, get as getRegistered } from '@teya/runtime'
 
 const CONFIG_DIR = join(process.env.HOME || '.', '.teya')
 const LOG_PREFIX = '\x1b[90m[scheduler]\x1b[0m'
@@ -38,10 +38,21 @@ function log(msg: string): void {
 async function main(): Promise<void> {
   log('Starting...')
 
-  // 1. Health & PID
-  const health = new HealthManager(CONFIG_DIR)
-  health.writePid()
-  health.startHeartbeat(10_000)
+  // 1. Register in the shared runtime registry. This writes the PID file,
+  //    starts the heartbeat, and installs signal cleanup hooks. The same
+  //    @teya/runtime module is used by CLI for `teya update` restart and
+  //    `teya runtime list` — single source of truth, no parallel pid files.
+  //
+  //    Capture the previous heartbeat (from the prior daemon instance, if
+  //    any) BEFORE register() overwrites the file — used by catch-up below.
+  const previousEntry = getRegistered('scheduler')
+  const previousHeartbeat = previousEntry ? new Date(previousEntry.lastHeartbeat) : null
+  registerProcess('scheduler', 'Scheduler daemon (cron tasks)', {
+    logFile: join(CONFIG_DIR, 'logs', 'scheduler.stderr.log'),
+    // We do our own ordered shutdown below — don't let runtime's default
+    // signal handlers exit the process before we close DBs / IPC.
+    installSignalHandlers: false,
+  })
 
   // 2. Load config
   let config: any = {}
@@ -87,10 +98,10 @@ async function main(): Promise<void> {
   // 8. Cron engine
   const engine = new CronEngine(store, executor, { maxConcurrent: 3 })
 
-  // 9. Catch-up
-  const lastBeat = health.readLastHeartbeat()
-  if (lastBeat) {
-    const caught = await engine.catchUp(lastBeat)
+  // 9. Catch-up — use the previous daemon's last heartbeat as the lower
+  //    bound for "missed cron windows".
+  if (previousHeartbeat) {
+    const caught = await engine.catchUp(previousHeartbeat)
     if (caught.length > 0) log(`Catch-up: executing ${caught.length} missed tasks`)
   }
 
@@ -99,7 +110,6 @@ async function main(): Promise<void> {
   const ipc = new IPCServer(join(CONFIG_DIR, 'scheduler.sock'), {
     store,
     engine,
-    health,
     getAgentCount: () => registry.list().length,
     startTime,
   })
@@ -139,14 +149,15 @@ async function main(): Promise<void> {
   const cronTasks = store.listCronTasks()
   log(`Ready. ${cronTasks.length} scheduled tasks, PID ${process.pid}`)
 
-  // 12. Graceful shutdown
+  // 12. Graceful shutdown — drain in order, then exit. The 'exit' event
+  //     handler installed by @teya/runtime.register() removes our registry
+  //     file regardless of how we exit.
   const shutdown = async (signal: string) => {
     log(`${signal} received, shutting down...`)
     clearInterval(tickInterval)
     clearInterval(summaryInterval)
     await executor.waitForAll(30_000)
     await ipc.stop()
-    health.cleanup()
     sessionStore.close()
     kg.close()
     store.close()
@@ -180,14 +191,21 @@ function createCheapLLM(config: any): ((system: string, user: string) => Promise
   }
 }
 
-// Last-resort safety net: cron tasks must keep firing even if some
-// downstream code throws an unhandled error or rejects a promise. Without
-// this the daemon dies on the first IPC hiccup or stray third-party throw.
+// Crash-fast on uncaught errors. We DON'T silently swallow them — Node's
+// own docs warn that "It is not safe to resume normal operation after
+// 'uncaughtException'", and a daemon writing to SQLite under a corrupt
+// state can lose data. Instead: log → exit(1) → the next teya CLI/Telegram
+// startup will spawn a fresh daemon via ensureSchedulerRunning(). The
+// runtime registry's 'exit' handler still removes our pid file on the way
+// out, so list() / `teya runtime list` reflect reality.
 process.on('uncaughtException', err => {
-  log(`uncaughtException: ${err.message}`)
+  log(`uncaughtException (exiting): ${err.stack || err.message}`)
+  process.exit(1)
 })
 process.on('unhandledRejection', reason => {
-  log(`unhandledRejection: ${reason instanceof Error ? reason.message : String(reason)}`)
+  const msg = reason instanceof Error ? (reason.stack || reason.message) : String(reason)
+  log(`unhandledRejection (exiting): ${msg}`)
+  process.exit(1)
 })
 
 main().catch(err => {

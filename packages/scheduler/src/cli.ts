@@ -12,9 +12,9 @@ import { spawn } from 'child_process'
 import { join } from 'path'
 import { writeFileSync, unlinkSync, existsSync, mkdirSync } from 'fs'
 import { execSync } from 'child_process'
-import { HealthManager } from './health.js'
 import { createIPCClient } from './ipc.js'
 import { TaskStore } from './task-store.js'
+import { get as getRegistered, stop as stopRegistered } from '@teya/runtime'
 
 const CONFIG_DIR = join(process.env.HOME || '.', '.teya')
 const PLIST_LABEL = 'com.teya.scheduler'
@@ -39,9 +39,11 @@ export async function ensureSchedulerRunning(opts: { silent?: boolean } = {}): P
   const log = opts.silent ? () => {} : (msg: string) => console.log(msg)
   const daemonPath = join(import.meta.dirname, 'daemon.js')
 
-  const health = HealthManager.isAlive(CONFIG_DIR)
-  if (health.alive) {
-    return { pid: health.pid!, alreadyRunning: true, daemonPath }
+  // Check the runtime registry — single source of truth for "is the
+  // scheduler daemon alive". get() prunes stale entries automatically.
+  const existing = getRegistered('scheduler')
+  if (existing) {
+    return { pid: existing.pid, alreadyRunning: true, daemonPath }
   }
 
   const logsDir = join(CONFIG_DIR, 'logs')
@@ -60,12 +62,16 @@ export async function ensureSchedulerRunning(opts: { silent?: boolean } = {}): P
   child.stderr?.pipe(stderr)
   child.unref()
 
-  // Wait briefly for the daemon to write its PID file via HealthManager.
-  await new Promise(resolve => setTimeout(resolve, 1500))
-  const newHealth = HealthManager.isAlive(CONFIG_DIR)
-  if (newHealth.alive) {
-    log(`Scheduler started (PID ${newHealth.pid})`)
-    return { pid: newHealth.pid!, alreadyRunning: false, daemonPath }
+  // Wait briefly for the daemon to register itself in @teya/runtime.
+  // Poll instead of fixed sleep — typically resolves in 300–800ms.
+  const deadline = Date.now() + 4000
+  while (Date.now() < deadline) {
+    const fresh = getRegistered('scheduler')
+    if (fresh) {
+      log(`Scheduler started (PID ${fresh.pid})`)
+      return { pid: fresh.pid, alreadyRunning: false, daemonPath }
+    }
+    await new Promise(resolve => setTimeout(resolve, 100))
   }
   log('Failed to start scheduler. Check logs: ~/.teya/logs/scheduler.stderr.log')
   return null
@@ -84,26 +90,17 @@ export async function handleSchedulerCommand(args: string[]): Promise<void> {
     }
 
     case 'stop': {
-      const health = HealthManager.isAlive(CONFIG_DIR)
-      if (!health.alive) {
-        console.log('Scheduler is not running')
-        return
-      }
-      try {
-        process.kill(health.pid!, 'SIGTERM')
-        console.log(`Scheduler stopped (PID ${health.pid})`)
-      } catch {
-        console.error(`Failed to stop scheduler (PID ${health.pid})`)
-      }
+      // Delegate to runtime registry — handles SIGTERM + timeout + SIGKILL
+      // and removes the registry entry on success.
+      const wasRunning = await stopRegistered('scheduler')
+      console.log(wasRunning ? 'Scheduler stopped' : 'Scheduler is not running')
       break
     }
 
     case 'status': {
-      const health = HealthManager.isAlive(CONFIG_DIR)
-      if (!health.alive) {
+      const entry = getRegistered('scheduler')
+      if (!entry) {
         console.log('Scheduler: not running')
-
-        // Show task count anyway
         try {
           const store = new TaskStore()
           const cronTasks = store.listCronTasks()
@@ -127,7 +124,7 @@ export async function handleSchedulerCommand(args: string[]): Promise<void> {
           if (d.lastTick) console.log(`Last tick: ${d.lastTick}`)
         }
       } catch {
-        console.log(`Scheduler: running (PID ${health.pid}) but IPC not responding`)
+        console.log(`Scheduler: running (PID ${entry.pid}) but IPC not responding`)
       }
       break
     }
