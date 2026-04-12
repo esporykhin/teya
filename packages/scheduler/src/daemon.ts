@@ -180,6 +180,16 @@ function createCheapLLM(config: any): ((system: string, user: string) => Promise
   }
 }
 
+// Last-resort safety net: cron tasks must keep firing even if some
+// downstream code throws an unhandled error or rejects a promise. Without
+// this the daemon dies on the first IPC hiccup or stray third-party throw.
+process.on('uncaughtException', err => {
+  log(`uncaughtException: ${err.message}`)
+})
+process.on('unhandledRejection', reason => {
+  log(`unhandledRejection: ${reason instanceof Error ? reason.message : String(reason)}`)
+})
+
 main().catch(err => {
   log(`Fatal: ${err.message}`)
   process.exit(1)

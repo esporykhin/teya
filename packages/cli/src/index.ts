@@ -912,16 +912,43 @@ async function main() {
     abortController?.abort()
   })
 
-  // Check if scheduler daemon is running
-  const schedulerHealth = HealthManager.isAlive(join(process.env.HOME || '.', '.teya'))
-  if (schedulerHealth.alive) {
-    const cronTasks = taskStore.listCronTasks()
-    if (cronTasks.length > 0) console.log(`\x1b[90mScheduler: ${cronTasks.length} cron tasks (PID ${schedulerHealth.pid})\x1b[0m`)
-  } else {
-    const cronTasks = taskStore.listCronTasks()
-    if (cronTasks.length > 0) {
-      console.log(`\x1b[33mScheduler not running — ${cronTasks.length} cron tasks won't execute. Run: teya scheduler start\x1b[0m`)
+  // Auto-bootstrap the scheduler daemon. The scheduler runs as a separate
+  // detached process so cron tasks fire even when this teya CLI/Telegram
+  // process exits. Idempotent: ensureSchedulerRunning() returns the existing
+  // PID if already alive. Opt out with --no-scheduler.
+  const noScheduler = args['no-scheduler'] !== undefined
+  const cronTasks = taskStore.listCronTasks()
+  if (!noScheduler && cronTasks.length > 0) {
+    const { ensureSchedulerRunning } = await import('@teya/scheduler')
+    const result = await ensureSchedulerRunning({ silent: true })
+    if (result) {
+      const tag = result.alreadyRunning ? 'attached' : 'started'
+      console.log(`\x1b[90mScheduler: ${cronTasks.length} cron tasks, ${tag} (PID ${result.pid})\x1b[0m`)
+      // Register the daemon in the runtime registry on its behalf so
+      // `teya update` can restart it after a build. The daemon doesn't
+      // import @teya/cli so we write the entry from here.
+      if (!result.alreadyRunning) {
+        const { mkdirSync, writeFileSync } = await import('fs')
+        const runDir = join(process.env.HOME || '.', '.teya', 'run')
+        mkdirSync(runDir, { recursive: true })
+        writeFileSync(
+          join(runDir, 'scheduler.json'),
+          JSON.stringify({
+            id: 'scheduler',
+            pid: result.pid,
+            startedAt: new Date().toISOString(),
+            args: [result.daemonPath],
+            description: 'Scheduler daemon (cron tasks)',
+            logFile: join(process.env.HOME || '.', '.teya', 'logs', 'scheduler.stderr.log'),
+          }, null, 2),
+          'utf-8',
+        )
+      }
+    } else {
+      console.log(`\x1b[33mScheduler: ${cronTasks.length} cron tasks but daemon failed to start (~/.teya/logs/scheduler.stderr.log)\x1b[0m`)
     }
+  } else if (cronTasks.length > 0) {
+    console.log(`\x1b[90mScheduler: ${cronTasks.length} cron tasks (auto-start disabled by --no-scheduler)\x1b[0m`)
   }
 
   await transport.start()

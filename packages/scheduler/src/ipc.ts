@@ -57,18 +57,42 @@ export class IPCServer {
     // Remove stale socket
     try { unlinkSync(socketPath) } catch {}
 
-    this.server = createServer(conn => {
+    // allowHalfOpen: true is CRITICAL. Without it, when the client calls
+    // conn.end() to signal "request complete", Node automatically closes
+    // OUR writable side too — before our async handler can compose a
+    // response. The server then silently sends an empty body and the CLI
+    // reports "IPC not responding". Half-open lets us read the request,
+    // process it, and write back on the still-open writable half.
+    this.server = createServer({ allowHalfOpen: true }, conn => {
       let data = ''
+      // Without an error handler, a broken pipe or write-after-end on this
+      // socket bubbles up as an unhandled 'error' event and crashes the
+      // entire daemon. Swallow socket errors — the IPC protocol is
+      // best-effort, the daemon must keep running cron tasks regardless.
+      conn.on('error', () => {})
       conn.on('data', chunk => { data += chunk.toString() })
       conn.on('end', async () => {
+        let payload: string
         try {
           const request: IPCRequest = JSON.parse(data)
           const response = await this.handle(request)
-          conn.end(JSON.stringify(response))
+          payload = JSON.stringify(response)
         } catch (err) {
-          conn.end(JSON.stringify({ type: 'error', message: (err as Error).message }))
+          payload = JSON.stringify({ type: 'error', message: (err as Error).message })
         }
+        // Try to write the response. If the client tore down the connection
+        // (timeout, kill) any of these calls may throw — swallowing them
+        // is fine because the protocol is best-effort.
+        try {
+          if (!conn.destroyed) conn.end(payload)
+        } catch {}
       })
+    })
+    // Defensive: server-level error handler prevents listen-time issues
+    // (stale socket, EADDRINUSE) from crashing the process.
+    this.server.on('error', err => {
+      // eslint-disable-next-line no-console
+      console.error(`[ipc] server error: ${(err as Error).message}`)
     })
   }
 

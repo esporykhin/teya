@@ -20,44 +20,65 @@ const CONFIG_DIR = join(process.env.HOME || '.', '.teya')
 const PLIST_LABEL = 'com.teya.scheduler'
 const PLIST_PATH = join(process.env.HOME || '.', 'Library', 'LaunchAgents', `${PLIST_LABEL}.plist`)
 
+export interface EnsureSchedulerResult {
+  pid: number
+  /** True if the daemon was already running before this call. */
+  alreadyRunning: boolean
+  /** Path to the daemon entry point that was spawned (or would be on respawn). */
+  daemonPath: string
+}
+
+/**
+ * Ensure the scheduler daemon is running. Idempotent — if already alive,
+ * returns its PID. Otherwise spawns a detached child process and waits up
+ * to 1.5s for it to come up. Used by:
+ *   - `teya scheduler start` (explicit invocation)
+ *   - main `teya` startup (auto-bootstrap so cron tasks fire out of the box)
+ */
+export async function ensureSchedulerRunning(opts: { silent?: boolean } = {}): Promise<EnsureSchedulerResult | null> {
+  const log = opts.silent ? () => {} : (msg: string) => console.log(msg)
+  const daemonPath = join(import.meta.dirname, 'daemon.js')
+
+  const health = HealthManager.isAlive(CONFIG_DIR)
+  if (health.alive) {
+    return { pid: health.pid!, alreadyRunning: true, daemonPath }
+  }
+
+  const logsDir = join(CONFIG_DIR, 'logs')
+  mkdirSync(logsDir, { recursive: true })
+
+  const child = spawn(process.execPath, [daemonPath], {
+    detached: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, NODE_ENV: 'production' },
+  })
+
+  const { createWriteStream } = await import('fs')
+  const stdout = createWriteStream(join(logsDir, 'scheduler.stdout.log'), { flags: 'a' })
+  const stderr = createWriteStream(join(logsDir, 'scheduler.stderr.log'), { flags: 'a' })
+  child.stdout?.pipe(stdout)
+  child.stderr?.pipe(stderr)
+  child.unref()
+
+  // Wait briefly for the daemon to write its PID file via HealthManager.
+  await new Promise(resolve => setTimeout(resolve, 1500))
+  const newHealth = HealthManager.isAlive(CONFIG_DIR)
+  if (newHealth.alive) {
+    log(`Scheduler started (PID ${newHealth.pid})`)
+    return { pid: newHealth.pid!, alreadyRunning: false, daemonPath }
+  }
+  log('Failed to start scheduler. Check logs: ~/.teya/logs/scheduler.stderr.log')
+  return null
+}
+
 export async function handleSchedulerCommand(args: string[]): Promise<void> {
   const action = args[0]
 
   switch (action) {
     case 'start': {
-      const health = HealthManager.isAlive(CONFIG_DIR)
-      if (health.alive) {
-        console.log(`Scheduler already running (PID ${health.pid})`)
-        return
-      }
-
-      // Spawn daemon as detached process
-      const daemonPath = join(import.meta.dirname, 'daemon.js')
-      const logsDir = join(CONFIG_DIR, 'logs')
-      mkdirSync(logsDir, { recursive: true })
-
-      const child = spawn(process.execPath, [daemonPath], {
-        detached: true,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env: { ...process.env, NODE_ENV: 'production' },
-      })
-
-      // Pipe daemon output to log files
-      const { createWriteStream } = await import('fs')
-      const stdout = createWriteStream(join(logsDir, 'scheduler.stdout.log'), { flags: 'a' })
-      const stderr = createWriteStream(join(logsDir, 'scheduler.stderr.log'), { flags: 'a' })
-      child.stdout?.pipe(stdout)
-      child.stderr?.pipe(stderr)
-
-      child.unref()
-
-      // Wait briefly and check
-      await new Promise(resolve => setTimeout(resolve, 1500))
-      const newHealth = HealthManager.isAlive(CONFIG_DIR)
-      if (newHealth.alive) {
-        console.log(`Scheduler started (PID ${newHealth.pid})`)
-      } else {
-        console.error('Failed to start scheduler. Check logs: ~/.teya/logs/scheduler.stderr.log')
+      const result = await ensureSchedulerRunning()
+      if (result?.alreadyRunning) {
+        console.log(`Scheduler already running (PID ${result.pid})`)
       }
       break
     }
