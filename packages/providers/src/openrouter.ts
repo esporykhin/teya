@@ -331,6 +331,15 @@ interface FetchWithRetryResult {
   attemptStartMs: number
 }
 
+/**
+ * Per-request HTTP timeout. Without this, a stuck provider (e.g. AkashML
+ * holding gemma's TCP connection open without ever sending a body) will
+ * hang the entire agent loop until the outer task.timeoutMs aborts it —
+ * 6+ minutes wasted on one zombie call. 90s is generous enough for slow
+ * cold-start models but bounds the worst case.
+ */
+const REQUEST_TIMEOUT_MS = 90_000
+
 async function fetchWithRetry(
   url: string,
   init: RequestInit,
@@ -342,20 +351,35 @@ async function fetchWithRetry(
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     if (signal?.aborted) throw new Error('Request aborted')
 
+    // Combine the caller's signal (task-level timeout, user cancel) with
+    // a per-attempt timeout signal so a hung provider can't block forever.
+    const attemptCtrl = new AbortController()
+    const timeoutHandle = setTimeout(() => attemptCtrl.abort(new Error('HTTP request timeout')), REQUEST_TIMEOUT_MS)
+    const onParentAbort = () => attemptCtrl.abort()
+    if (signal) {
+      if (signal.aborted) attemptCtrl.abort()
+      else signal.addEventListener('abort', onParentAbort, { once: true })
+    }
+
     try {
       const attemptStartMs = Date.now()
-      const response = await fetch(url, { ...init, signal })
-      // TTFB = headers received. fetch() resolves at headers, body still streaming.
+      const response = await fetch(url, { ...init, signal: attemptCtrl.signal })
       const ttfbMs = Date.now() - attemptStartMs
 
-      // Success or non-retryable error — return immediately
+      // Success or non-retryable error — return immediately. Don't clear the
+      // timeout yet: the body is still streaming and we want it bounded too.
+      // The caller will fully read the response next, then GC will clean up.
       if (response.ok || !RETRYABLE_STATUS.has(response.status)) {
+        clearTimeout(timeoutHandle)
+        if (signal) signal.removeEventListener('abort', onParentAbort)
         return { response, retryCount, ttfbMs, attemptStartMs }
       }
 
       // Retryable status — read error for logging, then retry
       const errorText = await response.text().catch(() => '')
       lastError = new Error(`HTTP ${response.status}: ${errorText.slice(0, 200)}`)
+      clearTimeout(timeoutHandle)
+      if (signal) signal.removeEventListener('abort', onParentAbort)
 
       if (attempt < MAX_RETRIES) {
         const delay = BASE_DELAY_MS * Math.pow(2, attempt) + Math.random() * 500
@@ -363,8 +387,16 @@ async function fetchWithRetry(
         await new Promise(resolve => setTimeout(resolve, delay))
       }
     } catch (err) {
+      clearTimeout(timeoutHandle)
+      if (signal) signal.removeEventListener('abort', onParentAbort)
+
       lastError = err as Error
       if (signal?.aborted) throw lastError
+
+      // Per-attempt HTTP timeout fired — counts as a retryable error so the
+      // next provider attempt gets a fresh socket.
+      const isTimeout = (err as Error).message?.includes('timeout') || attemptCtrl.signal.aborted
+      if (!isTimeout && attempt >= MAX_RETRIES) throw lastError
 
       if (attempt < MAX_RETRIES) {
         const delay = BASE_DELAY_MS * Math.pow(2, attempt) + Math.random() * 500
