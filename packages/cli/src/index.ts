@@ -7,7 +7,7 @@ import * as readline from 'readline'
 import { readFile, writeFile, mkdir } from 'fs/promises'
 import { join } from 'path'
 import { agentLoop, buildSystemPrompt } from '@teya/core'
-import { loadSkills, buildSkillsMetadata, buildActiveSkillContent, buildVerifiedSkillsCatalog } from '@teya/skills'
+import { loadSkills, buildSkillsMetadata, buildActiveSkillContent } from '@teya/skills'
 import type { Message, LLMProvider, MessageContext } from '@teya/core'
 import { openrouter, ollama, codex, withToolAdapter, fallback } from '@teya/providers'
 import { createToolRegistry, registerBuiltins, createMCPManager, createDynamicToolLoader, closeBrowser, initWorkspace, getWorkspaceInfo } from '@teya/tools'
@@ -27,10 +27,13 @@ import {
 import { DataStoreRegistry, createDataTools } from '@teya/data'
 import {
   runWithIdentity,
+  runWithSession,
   makeIdentityContext,
   type Identity,
   type IdentityContext,
+  type ToolResultEntry,
 } from '@teya/core'
+import { createToolLoadTool } from '@teya/tools'
 
 const CONFIG_DIR = join(process.env.HOME || process.env.USERPROFILE || '.', '.teya')
 const CONFIG_FILE = join(CONFIG_DIR, 'config.json')
@@ -492,8 +495,15 @@ async function main() {
     Promise.all([mcpManager.disconnectAll(), closeBrowser()]).finally(() => process.exit(0))
   })
 
-  // Create dynamic tool loader — sync tool list after all tools are registered
+  // Create dynamic tool loader — sync tool list after all tools are registered.
   const toolLoader = createDynamicToolLoader()
+
+  // Register the tool catalog activation primitive (core:tool_load).
+  // It needs both the loader (to flag tools as activated) and the registry
+  // (to fetch full schemas for the response payload), so it's wired here
+  // via factory rather than as a static builtin.
+  toolRegistry.register(createToolLoadTool(toolLoader, toolRegistry))
+
   toolLoader.setTools(toolRegistry.list())
 
   // Load skills from cwd/skills/ and ~/.teya/skills/
@@ -502,18 +512,23 @@ async function main() {
   const allSkills = [...localSkills, ...globalSkills]
   if (allSkills.length > 0) console.log(`\x1b[90m${allSkills.length} skill${allSkills.length === 1 ? '' : 's'} loaded\x1b[0m`)
 
-  // Build skills content for system prompt:
-  // if few skills (<5) — include full bodies; otherwise just metadata
+  // Build skills content for system prompt.
+  // ONLY installed skills go into the prompt — these are the ones the user
+  // explicitly chose for this Teya. The verified skills catalog is a
+  // user-facing browse list (use `teya skill verified`) and must NOT be
+  // injected into every LLM call: it's ~700 tokens of metadata about skills
+  // the agent can't even use yet. Cost compounds across every turn.
+  //
+  // If few skills (<5) — include full bodies; otherwise just metadata.
   const skillsMetadata = buildSkillsMetadata(allSkills)
   const activeSkillContent = allSkills.length > 0 && allSkills.length < 5
     ? buildActiveSkillContent(allSkills)
     : ''
-  const verifiedSkillsCatalog = await buildVerifiedSkillsCatalog()
 
   // Build system prompt (reads SOUL.md / AGENTS.md from cwd if present)
   const systemPrompt = await buildSystemPrompt({
     agentDir: process.cwd(),
-    skillsMetadata: [skillsMetadata, verifiedSkillsCatalog].filter(Boolean).join('\n\n') || undefined,
+    skillsMetadata: skillsMetadata || undefined,
     activeSkillContent: activeSkillContent || undefined,
   }) + '\n\n' + getWorkspaceInfo()
 
@@ -540,6 +555,10 @@ async function main() {
     toolsUsed: Set<string>
     agentsUsed: Set<string>
     taskIds: Set<string>
+    /** Per-route tool result store. Sliding-window compaction stashes full
+     *  tool outputs here keyed by toolCallId so the agent can retrieve them
+     *  via core:tool_result_get after the in-history copy is summarised. */
+    toolResults: Map<string, ToolResultEntry>
   }
   const routes = new Map<string, RouteState>()
 
@@ -583,6 +602,7 @@ async function main() {
       toolsUsed: new Set(session.toolsUsed || []),
       agentsUsed: new Set(session.agentsUsed || []),
       taskIds: new Set(session.taskIds || []),
+      toolResults: new Map(),
     }
     routes.set(key, state)
     return state
@@ -675,6 +695,7 @@ async function main() {
       toolsUsed: new Set(),
       agentsUsed: new Set(),
       taskIds: new Set(),
+      toolResults: new Map(),
     }
     routes.set(key, state)
     toolLoader.resetSession()
@@ -1044,8 +1065,11 @@ Rules:
         userMessage: message.slice(0, 500),
       })
 
+      // Wrap agentLoop in runWithSession so leaf modules (core:tool_result_get,
+      // sliding-window compaction in agent-loop) can read the per-route tool
+      // result store via getCurrentSession() — no extra arg threading.
       try {
-        const events = agentLoop(
+        const events = runWithSession({ sessionId: route.session.id, toolResults: route.toolResults }, () => agentLoop(
           {
             provider: activeProvider,
             toolRegistry,
@@ -1058,7 +1082,7 @@ Rules:
           route.history,
           abortController?.signal,
           images,
-        )
+        ))
 
         for await (const event of events) {
           tracer?.processEvent(event)

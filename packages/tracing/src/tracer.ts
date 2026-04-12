@@ -286,11 +286,35 @@ export class AgentTracer {
         s.attributes['gen_ai.request.tools_tokens'] = event.toolsTokens
         s.attributes['gen_ai.request.messages_count'] = event.messagesCount
         s.attributes['gen_ai.request.tools_count'] = event.toolsCount
+        if (event.toolsFullCount !== undefined) s.attributes['gen_ai.request.tools_full_count'] = event.toolsFullCount
+        if (event.toolsStubCount !== undefined) s.attributes['gen_ai.request.tools_stub_count'] = event.toolsStubCount
         s.attributes['gen_ai.request.input_tokens_estimate'] = event.totalInputTokensEstimate
         // Mirror onto the turn span so dashboards can read it without joining.
         if (this.turnSpan) {
           this.turnSpan.attributes['request.tokens_estimate'] = event.totalInputTokensEstimate
           this.turnSpan.attributes['request.tools_count'] = event.toolsCount
+        }
+        break
+      }
+
+      case 'tool_result_truncated': {
+        // Lightweight standalone span — easy to query "how aggressively
+        // did sliding-window save context?" via cost --by-tool or directly.
+        const span = this.withContext(createSpan('context.truncate_tool_result', this.turnSpan?.spanId, this.traceId))
+        span.attributes['tool.name'] = event.tool
+        span.attributes['tool.call_id'] = event.callId
+        span.attributes['truncate.original_chars'] = event.originalChars
+        span.attributes['truncate.new_chars'] = event.newChars
+        span.attributes['truncate.saved_chars'] = event.originalChars - event.newChars
+        span.attributes['truncate.age_in_llm_steps'] = event.ageInLLMSteps
+        endSpan(span, 'ok')
+        this.exporter(span)
+        // Aggregate on the turn span for quick dashboards
+        if (this.turnSpan) {
+          const cur = (this.turnSpan.attributes['turn.tool_truncations'] as number) || 0
+          const savedCur = (this.turnSpan.attributes['turn.truncation_saved_chars'] as number) || 0
+          this.turnSpan.attributes['turn.tool_truncations'] = cur + 1
+          this.turnSpan.attributes['turn.truncation_saved_chars'] = savedCur + (event.originalChars - event.newChars)
         }
         break
       }

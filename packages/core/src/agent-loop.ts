@@ -4,6 +4,7 @@
  */
 import type { Message, AgentEvent, LLMProvider, ToolCall, ToolDefinition, ToolResult, AgentHooks, ProviderCapabilities } from './types.js'
 import { PermissionEngine, sanitizeExternalResult, checkDLP, type PermissionConfig } from './security.js'
+import { getCurrentSession } from './session-context.js'
 
 // ─── Context utilities (inlined to avoid circular dep: @teya/context imports @teya/core) ──
 
@@ -98,6 +99,123 @@ async function condenseMessagesAsync(messages: Message[], budget: number, summar
   }
 
   return { messages: [...systemMessages, truncatedSummary, ...keptMessages], phase }
+}
+
+/**
+ * Generate a compact summary of a tool result for sliding-window
+ * compaction. Tool-specific where useful (extracts exit codes, status
+ * codes, file ops); generic fallback otherwise.
+ *
+ * Output stays under ~150 chars so the in-history footprint drops from
+ * full result (often 1000-5000 chars) to a tiny pointer + retrieval id.
+ */
+function summarizeToolResult(toolName: string, content: string, callId: string): string {
+  const orig = content.length
+  const firstLine = content.split('\n')[0]?.trim() || ''
+  const preview = content.slice(0, 200).replace(/\s+/g, ' ').trim()
+
+  // Tool-specific extractors — pull the most informative bit.
+  let detail = ''
+  if (toolName === 'core:exec') {
+    const exitMatch = content.match(/Exit code (\d+)/i) || content.match(/exit:?\s*(\d+)/i)
+    if (exitMatch) detail = `exit=${exitMatch[1]}, `
+    const lines = content.split('\n').length
+    detail += `${lines} lines`
+  } else if (toolName === 'core:web' || toolName === 'core:web_fetch' || toolName === 'core:http_request') {
+    const statusMatch = content.match(/HTTP\s+(\d{3})/i) || content.match(/"status":\s*(\d{3})/)
+    if (statusMatch) detail = `HTTP ${statusMatch[1]}, `
+    detail += `${orig} chars`
+  } else if (toolName === 'core:files') {
+    detail = `${firstLine.slice(0, 80)}`
+  } else if (toolName === 'core:memory') {
+    const lines = content.split('\n').length
+    detail = `${lines} entries`
+  } else if (toolName === 'core:tasks') {
+    detail = `${firstLine.slice(0, 80)}`
+  } else {
+    detail = `${orig} chars`
+  }
+
+  return [
+    `[#${callId} ${toolName} truncated — ${detail}]`,
+    `First 200: ${preview}`,
+    `[Use core:tool_result_get(id="${callId}") to retrieve full content]`,
+  ].join('\n')
+}
+
+/**
+ * Sliding window compaction over the message list. For every tool result
+ * that's older than `windowSize` LLM steps AND larger than `minChars`,
+ * stash the full content into the session's tool result store and replace
+ * the in-history copy with a compact summary.
+ *
+ * Pure mutation of the messages array (returns it unchanged in identity,
+ * mutates entries in place — caller is responsible for passing a copy).
+ *
+ * Returns metadata about what was compacted so the agent loop can emit
+ * tool_result_truncated events for tracing.
+ */
+export interface SlidingCompactionResult {
+  truncations: Array<{ callId: string; tool: string; originalChars: number; newChars: number; ageInLLMSteps: number }>
+}
+
+export function applySlidingWindow(
+  messages: Message[],
+  opts: { windowSize?: number; minChars?: number } = {},
+): SlidingCompactionResult {
+  const windowSize = opts.windowSize ?? 3
+  const minChars = opts.minChars ?? 500
+
+  // Walk from the end backwards, counting LLM steps as we go.
+  // An "LLM step" is one assistant message (each assistant reply marks
+  // the boundary between calls). Tool messages don't count as steps —
+  // they're the result of the previous assistant call.
+  let llmStepCount = 0
+  const truncations: SlidingCompactionResult['truncations'] = []
+  const session = getCurrentSession()
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]
+    if (msg.role === 'assistant') {
+      llmStepCount++
+      continue
+    }
+    if (msg.role !== 'tool') continue
+
+    // Tool message — check age and size
+    if (llmStepCount <= windowSize) continue // still within recent window
+    if (!msg.content || msg.content.length <= minChars) continue
+    // Already compacted? Detect by our marker prefix.
+    if (msg.content.startsWith('[#')) continue
+
+    const callId = msg.toolCallId || `unknown-${i}`
+    const toolName = msg.name || 'unknown'
+    const originalChars = msg.content.length
+
+    // Stash full content in session store BEFORE rewriting the message.
+    if (session) {
+      session.toolResults.set(callId, {
+        id: callId,
+        toolName,
+        argsSummary: '',
+        fullContent: msg.content,
+        createdAt: Date.now() - llmStepCount * 1000, // approximate
+        retrievedCount: 0,
+      })
+    }
+
+    const summary = summarizeToolResult(toolName, msg.content, callId)
+    msg.content = summary
+    truncations.push({
+      callId,
+      tool: toolName,
+      originalChars,
+      newChars: summary.length,
+      ageInLLMSteps: llmStepCount,
+    })
+  }
+
+  return { truncations }
 }
 
 /** Estimate tokens spent on tool definitions (name, description, JSON schema). */
@@ -467,6 +585,16 @@ export async function* agentLoop(
         ? deps.toolLoader.selectTools(userMessage, deps.provider.capabilities)
         : deps.toolRegistry.list()
 
+      // Count how many tools are sent with full schema vs as stubs.
+      // Stub-mode tools have a placeholder description ending with "[STUB —"
+      // — that's the only signal we have without changing the type.
+      let toolsFullCount = 0
+      let toolsStubCount = 0
+      for (const t of toolsForRequest) {
+        if ((t.description || '').includes('[STUB —')) toolsStubCount++
+        else toolsFullCount++
+      }
+
       // Token decomposition — emitted BEFORE the network call so tracing can
       // see exactly how the input budget is split. This is the answer to
       // "where are my tokens going" questions.
@@ -482,6 +610,8 @@ export async function* agentLoop(
         toolsTokens,
         messagesCount: messages.length,
         toolsCount: toolsForRequest.length,
+        toolsFullCount,
+        toolsStubCount,
         totalInputTokensEstimate: systemTokens + messagesTokens + toolsTokens,
       }
 
@@ -668,8 +798,26 @@ export async function* agentLoop(
       deps.toolLoader?.markUsed(call.name)
     }
 
-    // ── 6. Condense context if needed ────────────────────────────────────────
+    // ── 6a. Sliding window compaction (per-turn, not budget-driven) ──────────
+    // Always run on every loop iteration. Compacts tool results older than
+    // 3 LLM steps and larger than 500 chars into compact summary + retrieval
+    // marker. Full content is stashed in the session's tool result store
+    // (via getCurrentSession()), retrievable through core:tool_result_get.
+    // This is the cheap, always-on optimization that prevents the "20-call
+    // turn re-pays for old web fetch results" problem.
+    const slidingResult = applySlidingWindow(messages, { windowSize: 3, minChars: 500 })
+    for (const t of slidingResult.truncations) {
+      yield {
+        type: 'tool_result_truncated',
+        callId: t.callId,
+        tool: t.tool,
+        originalChars: t.originalChars,
+        newChars: t.newChars,
+        ageInLLMSteps: t.ageInLLMSteps,
+      }
+    }
 
+    // ── 6b. Condense context if budget-pressured ─────────────────────────────
     const currentTokens = estimateMessagesTokens(messages)
     if (currentTokens > budget.condenserThreshold) {
       const condensed = await condenseMessagesAsync(messages, budget.effectiveBudget, summarizer)

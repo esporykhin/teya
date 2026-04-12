@@ -34,6 +34,7 @@ import {
 } from './browser.js'
 import { emailSendTool, emailListAccountsTool } from './email.js'
 import { respondTool } from './respond.js'
+import { toolResultGetTool } from './tool-result-get.js'
 
 // Re-exports
 export { thinkTool } from './think.js'
@@ -54,6 +55,8 @@ export {
 } from './browser.js'
 export { emailSendTool, emailListAccountsTool } from './email.js'
 export { respondTool } from './respond.js'
+export { toolResultGetTool } from './tool-result-get.js'
+export { createToolLoadTool } from './tool-load.js'
 
 export function registerBuiltins(registry: ToolRegistry): void {
   // Standalone tools
@@ -61,6 +64,7 @@ export function registerBuiltins(registry: ToolRegistry): void {
   registry.register(askUserTool)
   registry.register(planTool)
   registry.register(respondTool)
+  registry.register(toolResultGetTool)  // retrieves truncated tool results from session store
 
   // Compound domain tools
   registry.register(filesTool)       // core:files (read, write, list, find)

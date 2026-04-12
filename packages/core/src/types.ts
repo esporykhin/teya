@@ -207,7 +207,21 @@ export type AgentEvent =
       toolsTokens: number
       messagesCount: number
       toolsCount: number
+      /** Of the tools sent: how many had full schema vs short stub. */
+      toolsFullCount?: number
+      toolsStubCount?: number
       totalInputTokensEstimate: number
+    }
+  /** Emitted when the in-history copy of a tool result was compacted to
+   *  save context budget. The full content is still retrievable via
+   *  core:tool_result_get(id). */
+  | {
+      type: 'tool_result_truncated'
+      callId: string
+      tool: string
+      originalChars: number
+      newChars: number
+      ageInLLMSteps: number
     }
   /** Emitted asynchronously after thinking_end when provider can fetch
    *  authoritative billing/cache details (OpenRouter /generation). */
