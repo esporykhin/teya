@@ -203,6 +203,42 @@ if (subcommand === 'trace') {
   process.exit(0)
 }
 
+// Runtime registry — list / restart background teya processes.
+if (subcommand === 'runtime') {
+  const action = process.argv[3] || 'list'
+  const { list: listProcs, stop: stopProc, restartAll } = await import('./runtime-registry.js')
+  if (action === 'list' || action === 'ls') {
+    const procs = listProcs()
+    if (procs.length === 0) {
+      console.log('No background teya processes registered.')
+    } else {
+      console.log(`${procs.length} registered process(es):\n`)
+      for (const p of procs) {
+        const age = Math.floor((Date.now() - new Date(p.startedAt).getTime()) / 1000)
+        const ageStr = age < 60 ? `${age}s` : age < 3600 ? `${Math.floor(age / 60)}m` : `${Math.floor(age / 3600)}h`
+        console.log(`  ${p.id.padEnd(20)} pid=${String(p.pid).padEnd(7)} up=${ageStr.padEnd(6)} ${p.description}`)
+        console.log(`  ${' '.repeat(20)} log: ${p.logFile}`)
+      }
+    }
+  } else if (action === 'stop') {
+    const id = process.argv[4]
+    if (!id) { console.error('Usage: teya runtime stop <id>'); process.exit(1) }
+    const ok = await stopProc(id)
+    console.log(ok ? `Stopped ${id}` : `${id} was not running`)
+  } else if (action === 'restart') {
+    const restarted = await restartAll({ log: (msg) => console.log(msg) })
+    console.log(`\nRestarted ${restarted.length} process(es).`)
+  } else {
+    console.log(`teya runtime — manage background teya processes
+
+Commands:
+  list                List registered processes (default)
+  stop <id>           Gracefully stop one process
+  restart             Restart all registered processes`)
+  }
+  process.exit(0)
+}
+
 // teya eval run <suite.yaml>
 if (subcommand === 'eval') {
   const action = process.argv[3]
@@ -525,6 +561,9 @@ async function main() {
       process.exit(1)
     }
     transport = new TelegramTransport({ token: telegramToken })
+    // Register so `teya update` can restart this background process after a build.
+    const { register: registerProcess } = await import('./runtime-registry.js')
+    registerProcess('telegram', 'Telegram bot (HTTP API)')
   } else if (transportKind === 'telegram-userbot') {
     const apiIdRaw = args['telegram-api-id'] || process.env.TELEGRAM_API_ID || saved.telegramApiId || ''
     const apiHash = args['telegram-api-hash'] || process.env.TELEGRAM_API_HASH || saved.telegramApiHash || ''
@@ -564,6 +603,8 @@ async function main() {
         console.log(`\x1b[32m[telegram-userbot] Session saved to ${CONFIG_FILE}\x1b[0m`)
       },
     })
+    const { register: registerProcess } = await import('./runtime-registry.js')
+    registerProcess('telegram-userbot', 'Telegram userbot (MTProto)')
   } else {
     transport = new CLITransport()
     // Pass agent list for @mention autocomplete
@@ -709,7 +750,21 @@ async function main() {
               console.log(`\n\x1b[32mUpdated: ${result.beforeRef} -> ${result.afterRef} (${result.changes.length} commits)\x1b[0m`)
               for (const c of result.changes.slice(0, 5)) console.log(`  \x1b[90m${c}\x1b[0m`)
               if (result.changes.length > 5) console.log(`  \x1b[90m... and ${result.changes.length - 5} more\x1b[0m`)
-              console.log('\n\x1b[90mRestarting...\x1b[0m\n')
+
+              // Restart any background teya processes (Telegram bot, scheduler).
+              // They keep the OLD code in RAM until killed — without this, the
+              // disk binary is fresh but the running bot serves stale code.
+              const { restartAll, list: listProcs } = await import('./runtime-registry.js')
+              const others = listProcs().filter(p => p.pid !== process.pid)
+              if (others.length > 0) {
+                console.log(`\n\x1b[90mRestarting ${others.length} background process(es)...\x1b[0m`)
+                await restartAll({
+                  excludePid: process.pid,
+                  log: (msg) => console.log(`\x1b[90m${msg}\x1b[0m`),
+                })
+              }
+
+              console.log('\n\x1b[90mRestarting self...\x1b[0m\n')
               // Close databases before restart
               kg.close(); assetStore.close(); taskStore.close(); dataStore.close()
               await mcpManager.disconnectAll()
