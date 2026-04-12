@@ -509,50 +509,108 @@ async function main() {
   // Session store for persistence
   const sessionStore = new SessionStore()
 
-  // Per-session conversation history
-  let conversationHistory: Message[] = []
-  let currentSession: SessionState
+  /**
+   * Per-route session state. Each composite Telegram sessionId
+   * (e.g. "tg:123:t456") owns its own currentSession + conversationHistory
+   * + tools/agents tracking. CLI mode has exactly one entry. Telegram mode
+   * can have N concurrent entries (one per topic / per author / per chat).
+   *
+   * Without this map, two different Telegram topics would race to overwrite
+   * the same currentSession.messages and one would lose messages.
+   */
+  interface RouteState {
+    /** Underlying SessionState row from sessions.db */
+    session: SessionState
+    /** In-memory replay buffer — flushed to disk via sessionStore.save() */
+    history: Message[]
+    toolsUsed: Set<string>
+    agentsUsed: Set<string>
+    taskIds: Set<string>
+  }
+  const routes = new Map<string, RouteState>()
 
-  // Try to resume latest session on startup
-  const latestSession = await sessionStore.getLatest()
-  if (latestSession) {
-    conversationHistory = [...latestSession.messages]
-    currentSession = latestSession
-    console.log(`\x1b[90mSession ${latestSession.id.slice(0, 8)} — resuming (${latestSession.messages.length} messages)\x1b[0m`)
-  } else {
-    currentSession = sessionStore.createSession('default', transportType)
-    console.log(`\x1b[90mSession ${currentSession.id.slice(0, 8)}\x1b[0m`)
+  /**
+   * Resolve (or create) the RouteState for a given route id. The id can
+   * be undefined for legacy/CLI flows — in that case we resume the latest
+   * session in the DB. For Telegram-style ids ("tg:123:t456"), we look up
+   * the session by id and resume, or create a new one if missing.
+   */
+  async function getOrLoadRoute(routeId: string | undefined): Promise<RouteState> {
+    // Single-session "anchor" for CLI mode — anchored on the latest row
+    // at startup. For Telegram, every distinct routeId becomes its own slot.
+    const key = routeId || '__cli__'
+    const cached = routes.get(key)
+    if (cached) return cached
+
+    let session: SessionState | null = null
+    if (routeId) {
+      // Try to find a saved session whose id contains the routeId in its
+      // metadata (we use routeId as session.id directly when creating).
+      session = await sessionStore.load(routeId)
+    } else {
+      session = await sessionStore.getLatest()
+    }
+
+    if (!session) {
+      // Create a new row. For Telegram routes the row id IS the routeId,
+      // so resuming on the next message is O(1).
+      session = sessionStore.createSession('default', transportType)
+      if (routeId) {
+        // Replace the auto-generated UUID with the routeId so the saved
+        // session is keyed by route, not by random UUID.
+        session = { ...session, id: routeId }
+        await sessionStore.save(session)
+      }
+    }
+
+    const state: RouteState = {
+      session,
+      history: [...session.messages],
+      toolsUsed: new Set(session.toolsUsed || []),
+      agentsUsed: new Set(session.agentsUsed || []),
+      taskIds: new Set(session.taskIds || []),
+    }
+    routes.set(key, state)
+    return state
   }
 
-  // Seed the tracer with stable per-session attributes. Every span the
-  // tracer emits from now on inherits these — that's how `teya trace show <id>`
-  // can route per-session jsonl reliably.
+  // Bootstrap: resume the latest session for CLI mode (Telegram mode loads
+  // routes lazily on first message in each topic/chat).
+  const bootstrapRoute = await getOrLoadRoute(undefined)
+  console.log(
+    `\x1b[90mSession ${bootstrapRoute.session.id.slice(0, 8)} — resuming (${bootstrapRoute.history.length} messages)\x1b[0m`,
+  )
+
+  // Seed the tracer with the bootstrap session's attributes. The tracer's
+  // setContext() is called fresh on each message in the message handler.
   tracer?.setContext({
-    sessionId: currentSession.id,
-    agentId: currentSession.agentId || 'default',
+    sessionId: bootstrapRoute.session.id,
+    agentId: bootstrapRoute.session.agentId || 'default',
     transport: transportType,
   })
 
-  // Track metadata during session
-  const sessionToolsUsed = new Set<string>(currentSession.toolsUsed || [])
-  const sessionAgentsUsed = new Set<string>(currentSession.agentsUsed || [])
-  const sessionTaskIds = new Set<string>(currentSession.taskIds || [])
-
-  // Reset everything: new session row, empty history, clear tracked metadata.
-  // Used by /clear (CLI) and /clear via Telegram message intercept.
-  function resetSession() {
-    currentSession = sessionStore.createSession('default', transportType)
-    conversationHistory = []
+  /** Reset a single route — used by /clear. Removes the in-memory entry and
+   *  creates a fresh empty session for the same routeId. */
+  async function resetRoute(routeId: string | undefined): Promise<RouteState> {
+    const key = routeId || '__cli__'
+    routes.delete(key)
+    // Force creation of a fresh session row for this routeId.
+    let session = sessionStore.createSession('default', transportType)
+    if (routeId) {
+      session = { ...session, id: routeId }
+      await sessionStore.save(session)
+    }
+    const state: RouteState = {
+      session,
+      history: [],
+      toolsUsed: new Set(),
+      agentsUsed: new Set(),
+      taskIds: new Set(),
+    }
+    routes.set(key, state)
     toolLoader.resetSession()
-    sessionToolsUsed.clear()
-    sessionAgentsUsed.clear()
-    sessionTaskIds.clear()
-    tracer?.resetForNewSession(currentSession.id)
-    tracer?.setContext({
-      sessionId: currentSession.id,
-      agentId: 'default',
-      transport: transportType,
-    })
+    tracer?.resetForNewSession(state.session.id)
+    return state
   }
 
   // Create transport
@@ -670,11 +728,11 @@ async function main() {
         }
 
         case '/clear': {
-          resetSession()
-          ;(transport as CLITransport).setSessionId(currentSession.id)
+          const fresh = await resetRoute(undefined)
+          ;(transport as CLITransport).setSessionId(fresh.session.id)
           console.clear()
           console.log('\x1b[1mTeya\x1b[0m')
-          console.log(`\x1b[90mNew session ${currentSession.id.slice(0, 8)}. Type / for commands.\x1b[0m\n`)
+          console.log(`\x1b[90mNew session ${fresh.session.id.slice(0, 8)}. Type / for commands.\x1b[0m\n`)
           break
         }
 
@@ -730,12 +788,16 @@ async function main() {
           break
         }
 
-        case '/status':
-          console.log(`\nSession: ${currentSession.id.slice(0, 8)}`)
-          console.log(`Messages: ${conversationHistory.length}`)
-          console.log(`Turns: ${conversationHistory.filter(m => m.role === 'assistant').length}`)
-          console.log(`Total turns: ${currentSession.totalTurns}\n`)
+        case '/status': {
+          const cur = await getOrLoadRoute(undefined)
+          console.log(`\nSession: ${cur.session.id.slice(0, 8)}`)
+          console.log(`Messages: ${cur.history.length}`)
+          console.log(`Turns: ${cur.history.filter(m => m.role === 'assistant').length}`)
+          console.log(`Total turns: ${cur.session.totalTurns}`)
+          if (routes.size > 1) console.log(`Active routes: ${routes.size}`)
+          console.log('')
           break
+        }
 
         case '/memory': {
           try {
@@ -753,10 +815,14 @@ async function main() {
           break
         }
 
-        case '/compact':
-          conversationHistory = []
+        case '/compact': {
+          const cur = await getOrLoadRoute(undefined)
+          cur.history = []
+          cur.session = { ...cur.session, messages: [] }
+          await sessionStore.save(cur.session)
           console.log('\x1b[90mContext cleared. Session preserved.\x1b[0m\n')
           break
+        }
 
         case '/update': {
           console.log('')
@@ -801,44 +867,50 @@ async function main() {
     })
   }
 
-  transport.onMessage(async (message, sessionId, images) => {
+  transport.onMessage(async (message, ctx) => {
     abortController = new AbortController()
+    const routeKey = isBackgroundProcess ? ctx.sessionId : undefined
 
     // Slash command intercept — works for ALL transports (Telegram included).
-    // Without this, /clear typed in Telegram goes to the LLM as a normal message
-    // and the conversation history keeps growing forever.
+    // Without this, /clear typed in Telegram goes to the LLM as a normal
+    // message and the per-route history keeps growing forever.
     const trimmed = message.trim()
     if (trimmed.startsWith('/')) {
       const cmd = trimmed.split(/\s+/)[0]
-      if (cmd === '/clear') {
-        resetSession()
-        const note = `New session ${currentSession.id.slice(0, 8)}.`
-        if (isTelegramAny) transport.send({ type: 'response', content: note }, sessionId)
+      if (cmd === '/clear' || cmd === '/new') {
+        const fresh = await resetRoute(routeKey)
+        const note = `New session ${fresh.session.id.slice(0, 8)}.`
+        if (isTelegramAny) transport.send({ type: 'response', content: note }, ctx.sessionId)
         else { console.clear(); console.log('\x1b[1mTeya\x1b[0m'); console.log(`\x1b[90m${note}\x1b[0m\n`); (transport as CLITransport).prompt() }
         return
       }
       if (cmd === '/compact') {
-        conversationHistory = []
-        currentSession = { ...currentSession, messages: [] }
-        await sessionStore.save(currentSession)
+        const cur = await getOrLoadRoute(routeKey)
+        cur.history = []
+        cur.session = { ...cur.session, messages: [] }
+        await sessionStore.save(cur.session)
         const note = 'Context cleared. Session preserved.'
-        if (isTelegramAny) transport.send({ type: 'response', content: note }, sessionId)
+        if (isTelegramAny) transport.send({ type: 'response', content: note }, ctx.sessionId)
         else { console.log(`\x1b[90m${note}\x1b[0m\n`); (transport as CLITransport).prompt() }
         return
       }
       if (cmd === '/status') {
-        const tokens = Math.ceil(conversationHistory.reduce((s, m) => s + (m.content?.length || 0), 0) / 3.5)
-        const note = `session=${currentSession.id.slice(0, 8)} messages=${conversationHistory.length} ~tokens=${tokens} turns=${currentSession.totalTurns} cost=$${(currentSession.totalCost || 0).toFixed(4)}`
-        if (isTelegramAny) transport.send({ type: 'response', content: note }, sessionId)
+        const cur = await getOrLoadRoute(routeKey)
+        const tokens = Math.ceil(cur.history.reduce((s, m) => s + (m.content?.length || 0), 0) / 3.5)
+        const note = `session=${cur.session.id.slice(0, 8)} messages=${cur.history.length} ~tokens=${tokens} turns=${cur.session.totalTurns} cost=$${(cur.session.totalCost || 0).toFixed(4)}`
+        if (isTelegramAny) transport.send({ type: 'response', content: note }, ctx.sessionId)
         else { console.log(`\x1b[90m${note}\x1b[0m\n`); (transport as CLITransport).prompt() }
         return
       }
     }
 
-    // Auto-switch to vision model when images are attached
+    // Resolve the route — this is the per-topic / per-author isolated state.
+    const route = await getOrLoadRoute(routeKey)
+
+    // Vision model auto-switch when images are attached
     let activeProvider = provider
+    const images = ctx.images
     if (images && images.length > 0) {
-      // Map known text-only models to their vision counterparts
       const visionMap: Record<string, string> = {
         'z-ai/glm-5-turbo': 'z-ai/glm-5v-turbo',
         'z-ai/glm-5': 'z-ai/glm-5v-turbo',
@@ -852,9 +924,22 @@ async function main() {
       }
     }
 
-    // Stamp the current user message into trace context so spans created
-    // during this turn carry it. Truncated to keep traces compact.
-    tracer?.setContext({ userMessage: message.slice(0, 500) })
+    // In groups, prefix the message with sender attribution so the LLM
+    // can distinguish authors in multi-user threads. In private chats /
+    // CLI, message is left untouched.
+    let effectiveMessage = message
+    if (ctx.sender && ctx.chat && ctx.chat.kind !== 'private' && ctx.chat.kind !== 'cli') {
+      const author = ctx.sender.displayName || (ctx.sender.username && '@' + ctx.sender.username) || `user-${ctx.sender.id}`
+      effectiveMessage = `[from: ${author}] ${message}`
+    }
+
+    // Stamp per-message trace context: route, sender, chat metadata.
+    tracer?.setContext({
+      sessionId: route.session.id,
+      agentId: route.session.agentId || 'default',
+      transport: transportType,
+      userMessage: message.slice(0, 500),
+    })
 
     try {
       const events = agentLoop(
@@ -866,8 +951,8 @@ async function main() {
           config: { maxTurns: 50, maxCostPerSession: 5 },
           hooks: {},
         },
-        message,
-        conversationHistory,
+        effectiveMessage,
+        route.history,
         abortController.signal,
         images,
       )
@@ -875,44 +960,37 @@ async function main() {
       for await (const event of events) {
         tracer?.processEvent(event)
 
-        // Schedule background billing lookup for each LLM call. Snapshots
-        // current trace context so the late span lands in the right session.
         if (event.type === 'thinking_end' && event.generationId && enricher) {
           enricher.enqueue(event.generationId, tracer!.getContext())
         }
 
-        // Track session metadata from events
         if (event.type === 'tool_start') {
-          sessionToolsUsed.add(event.tool)
-          // Track task references
+          route.toolsUsed.add(event.tool)
           if (event.tool === 'core:task_create' || event.tool === 'core:task_update') {
             const taskId = (event.args as any)?.id
-            if (taskId) sessionTaskIds.add(taskId)
+            if (taskId) route.taskIds.add(taskId)
           }
-          // Track agent delegation
           if (event.tool === 'core:delegate') {
             const agentId = (event.args as any)?.agent
-            if (agentId && agentId !== 'list') sessionAgentsUsed.add(agentId)
+            if (agentId && agentId !== 'list') route.agentsUsed.add(agentId)
           }
         }
 
         if (event.type === 'messages_updated') {
-          conversationHistory = [...event.messages]
-
-          // Update session with tracked metadata
-          currentSession = {
-            ...currentSession,
-            messages: conversationHistory,
+          route.history = [...event.messages]
+          route.session = {
+            ...route.session,
+            messages: route.history,
             updatedAt: new Date(),
-            totalTurns: currentSession.totalTurns + 1,
-            totalCost: tracer?.getSessionCost() || currentSession.totalCost,
-            toolsUsed: [...sessionToolsUsed],
-            agentsUsed: [...sessionAgentsUsed],
-            taskIds: [...sessionTaskIds],
+            totalTurns: route.session.totalTurns + 1,
+            totalCost: tracer?.getSessionCost() || route.session.totalCost,
+            toolsUsed: [...route.toolsUsed],
+            agentsUsed: [...route.agentsUsed],
+            taskIds: [...route.taskIds],
           }
-          await sessionStore.save(currentSession)
+          await sessionStore.save(route.session)
         } else {
-          transport.send(event, sessionId)
+          transport.send(event, ctx.sessionId)
         }
       }
     } catch (err: unknown) {

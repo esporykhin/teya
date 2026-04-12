@@ -10,7 +10,7 @@
 import * as readline from 'readline'
 import { readFileSync, existsSync } from 'fs'
 import { join } from 'path'
-import type { Transport, AgentEvent, MessageImage } from '@teya/core'
+import type { Transport, AgentEvent, MessageImage, MessageContext } from '@teya/core'
 
 const COMMANDS = [
   { name: '/clear',   description: 'New session + clear screen' },
@@ -33,7 +33,7 @@ export interface AgentInfo {
 
 export class CLITransport implements Transport {
   private rl: readline.Interface | null = null
-  private messageHandler: ((message: string, sessionId: string, images?: MessageImage[]) => void) | null = null
+  private messageHandler: ((message: string, ctx: MessageContext) => void) | null = null
   private cancelHandler: ((sessionId: string) => void) | null = null
   private commandHandler: ((command: string) => void | Promise<void>) | null = null
   private sessionId: string
@@ -49,7 +49,7 @@ export class CLITransport implements Transport {
     this.agents = agents
   }
 
-  onMessage(handler: (message: string, sessionId: string, images?: MessageImage[]) => void): void {
+  onMessage(handler: (message: string, ctx: MessageContext) => void): void {
     this.messageHandler = handler
   }
 
@@ -243,7 +243,11 @@ export class CLITransport implements Transport {
         }
       }
 
-      this.messageHandler?.(message, this.sessionId, images.length > 0 ? images : undefined)
+      this.messageHandler?.(message, {
+        sessionId: this.sessionId,
+        chat: { id: this.sessionId, kind: 'cli' },
+        images: images.length > 0 ? images : undefined,
+      })
     })
   }
 
@@ -270,7 +274,11 @@ export class CLITransport implements Transport {
       if (image) {
         const sizeKB = Math.round(image.data.length * 3 / 4 / 1024)
         console.log(gray(`  Clipboard image: ${sizeKB} KB`))
-        this.messageHandler?.('Describe what you see in this image.', this.sessionId, [image])
+        this.messageHandler?.('Describe what you see in this image.', {
+          sessionId: this.sessionId,
+          chat: { id: this.sessionId, kind: 'cli' },
+          images: [image],
+        })
       } else {
         console.log(yellow('No image in clipboard. Take a screenshot first (Cmd+Shift+4).\n'))
         this.prompt()

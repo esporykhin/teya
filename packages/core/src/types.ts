@@ -351,8 +351,57 @@ export interface AgentHooks {
 
 // ─── Transport ────────────────────────────────────────────────────────────────
 
+/**
+ * Per-message context provided by the transport. Lets the agent layer route
+ * to the right session, attribute author identity in groups, and pass
+ * user/chat metadata into tracing without coupling to any specific transport.
+ */
+export interface MessageContext {
+  /**
+   * Stable identifier for the conversation thread this message belongs to.
+   * Different transports compose this differently:
+   *   - cli                : a single id per process
+   *   - telegram private   : "tg:<chatId>"
+   *   - telegram group     : "tg:<chatId>:u<userId>"        (per-author)
+   *   - telegram forum     : "tg:<chatId>:t<threadId>"      (per-topic)
+   *
+   * The agent layer treats it as opaque — it just resumes/persists per id.
+   */
+  sessionId: string
+  /** Author of the message. Absent for transports without identity (CLI). */
+  sender?: MessageSender
+  /** Chat metadata for groups/channels. Absent for 1:1. */
+  chat?: MessageChat
+  /** Optional images attached to the message. */
+  images?: MessageImage[]
+}
+
+export interface MessageSender {
+  /** Stable per-transport user id (Telegram numeric id, etc). */
+  id: string
+  /** Display name as shown in the transport (Telegram first/last). */
+  displayName?: string
+  /** Handle / @username if the transport supports it. */
+  username?: string
+  /** True if this user has admin rights in the current chat. */
+  isAdmin?: boolean
+}
+
+export interface MessageChat {
+  /** Stable transport chat id. */
+  id: string
+  /** "private" | "group" | "supergroup" | "channel" | "cli". */
+  kind: 'private' | 'group' | 'supergroup' | 'channel' | 'cli'
+  /** Human-readable title (group name, channel name). */
+  title?: string
+  /** Telegram message_thread_id for forum supergroups. */
+  threadId?: number
+  /** Optional human label of the topic (forum topic name). */
+  threadTitle?: string
+}
+
 export interface Transport {
-  onMessage(handler: (message: string, sessionId: string, images?: MessageImage[]) => void): void
+  onMessage(handler: (message: string, ctx: MessageContext) => void): void
   send(event: AgentEvent, sessionId: string): void | Promise<void>
   onCancel?(handler: (sessionId: string) => void): void
   start(): Promise<void>

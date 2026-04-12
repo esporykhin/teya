@@ -16,13 +16,14 @@
  * After success the library prints a session string — store it in ~/.teya/config.json
  * as `telegramUserbotSession` to skip auth on subsequent runs.
  */
-import type { Transport, AgentEvent } from '@teya/core'
+import type { Transport, AgentEvent, MessageContext, MessageSender, MessageChat } from '@teya/core'
 import { TelegramClient, Api } from 'telegram'
 import { StringSession } from 'telegram/sessions/index.js'
 import { NewMessage, NewMessageEvent } from 'telegram/events/index.js'
 import * as readline from 'readline'
 import { appendFile, rename, stat } from 'fs/promises'
 import { join } from 'path'
+import { buildSessionId, parseSessionId, type ChatKind } from './session-id.js'
 
 export interface TelegramUserbotConfig {
   apiId: number
@@ -57,10 +58,10 @@ export class TelegramUserbotTransport implements Transport {
   readonly client: TelegramClient
   private stringSession: StringSession
   private cfg: TelegramUserbotConfig
-  private messageHandler: ((message: string, sessionId: string) => Promise<void>) | null = null
+  private messageHandler: ((message: string, ctx: MessageContext) => Promise<void>) | null = null
   private cancelHandler: ((sessionId: string) => void) | null = null
   private allowedChatIds?: Set<string>
-  private chatQueues: Map<string, { queue: Array<{ text: string }>; processing: boolean }> = new Map()
+  private chatQueues: Map<string, { queue: Array<{ text: string; ctx: MessageContext }>; processing: boolean }> = new Map()
   private readonly logFile = join(process.env.HOME || process.env.USERPROFILE || '.', '.teya', 'telegram-userbot.log')
   readonly LOG_MAX_BYTES = 10 * 1024 * 1024  // 10 MB
   ready = false
@@ -82,9 +83,9 @@ export class TelegramUserbotTransport implements Transport {
     }
   }
 
-  onMessage(handler: (message: string, sessionId: string) => void): void {
+  onMessage(handler: (message: string, ctx: MessageContext) => void): void {
     // Wrap sync handler to match internal async signature
-    this.messageHandler = async (message, sessionId) => { handler(message, sessionId) }
+    this.messageHandler = async (message, ctx) => { handler(message, ctx) }
   }
 
   onCancel(handler: (sessionId: string) => void): void {
@@ -130,7 +131,11 @@ export class TelegramUserbotTransport implements Transport {
   }
 
   async send(event: AgentEvent, sessionId: string): Promise<void> {
-    const peer = sessionId  // sessionId = chatId string
+    // Sessions like "tg:<chat>:t<thread>" — recover routing parameters.
+    const parsed = parseSessionId(sessionId)
+    if (!parsed) return
+    const peer = parsed.chatId
+    const topMsgId = parsed.threadId
 
     switch (event.type) {
       case 'thinking_start':
@@ -139,7 +144,8 @@ export class TelegramUserbotTransport implements Transport {
             await this.client.invoke(new Api.messages.SetTyping({
               peer,
               action: new Api.SendMessageTypingAction(),
-            }))
+              ...(topMsgId ? { topMsgId } : {}),
+            } as any))
           } catch {}
         }
         break
@@ -147,43 +153,43 @@ export class TelegramUserbotTransport implements Transport {
       case 'response': {
         const text = event.content || '(empty response)'
         this.appendLog({ direction: 'out', chatId: peer, text })
-        await this.sendLongMessage(peer, text)
+        await this.sendLongMessage(peer, text, topMsgId)
         break
       }
 
       case 'intermediate_response':
-        await this.safeSend(peer, event.content)
+        await this.safeSend(peer, event.content, topMsgId)
         break
 
       case 'ask_user':
-        await this.safeSend(peer, event.question)
+        await this.safeSend(peer, event.question, topMsgId)
         break
 
       case 'tool_error':
-        await this.safeSend(peer, `Tool error: ${event.tool} — ${event.error}`)
+        await this.safeSend(peer, `Tool error: ${event.tool} — ${event.error}`, topMsgId)
         break
 
       case 'error':
-        await this.safeSend(peer, `Error (${event.phase}): ${event.error}`)
+        await this.safeSend(peer, `Error (${event.phase}): ${event.error}`, topMsgId)
         break
 
       case 'cancelled':
-        await this.safeSend(peer, 'Cancelled.')
+        await this.safeSend(peer, 'Cancelled.', topMsgId)
         break
 
       case 'max_turns_reached':
-        await this.safeSend(peer, `Reached max turns (${event.turns}).`)
+        await this.safeSend(peer, `Reached max turns (${event.turns}).`, topMsgId)
         break
 
       case 'budget_exceeded':
-        await this.safeSend(peer, `Budget exceeded ($${event.cost.toFixed(4)}).`)
+        await this.safeSend(peer, `Budget exceeded ($${event.cost.toFixed(4)}).`, topMsgId)
         break
 
       case 'plan_proposed': {
         const planText = event.steps
           .map((s: { description: string }, i: number) => `${i + 1}. ${s.description}`)
           .join('\n')
-        await this.safeSend(peer, `Plan:\n${planText}`)
+        await this.safeSend(peer, `Plan:\n${planText}`, topMsgId)
         break
       }
 
@@ -203,16 +209,19 @@ export class TelegramUserbotTransport implements Transport {
     const rawText = msg.message
     const isOutgoing = msg.out === true
 
+    // Build the message context — sessionId, sender, chat metadata.
+    const ctx = await this.buildContext(msg, chatId)
+
     // Commands (only from self, so they don't pollute others' chats)
     if (isOutgoing) {
       const trimmed = rawText.trim()
       if (trimmed === '/teya:stop') {
-        this.cancelHandler?.(chatId)
-        await this.safeSend(chatId, 'Stopping current task...')
+        this.cancelHandler?.(ctx.sessionId)
+        await this.safeSend(chatId, 'Stopping current task...', ctx.chat?.threadId)
         return
       }
       if (trimmed === '/teya:ping') {
-        await this.safeSend(chatId, 'pong')
+        await this.safeSend(chatId, 'pong', ctx.chat?.threadId)
         return
       }
     }
@@ -224,15 +233,12 @@ export class TelegramUserbotTransport implements Transport {
     let payload: string | null = null
 
     if (isOutgoing && trigger && rawText.startsWith(trigger)) {
-      // You typed "!t ..." — route the rest to Teya in this chat
       payload = rawText.slice(trigger.length).trim()
     } else if (!isOutgoing && respondIncoming) {
-      // Incoming message from whitelisted peer
       if (this.allowedChatIds && !this.allowedChatIds.has(chatId)) return
       payload = rawText
     } else if (!this.allowedChatIds && !trigger) {
-      // Safe default: only Saved Messages (self-chat). peerId is PeerUser with self id.
-      // Detect self-chat: outgoing + peer is self.
+      // Safe default: only Saved Messages (self-chat).
       const me = await this.client.getMe().catch(() => null)
       const selfId = me && 'id' in me ? String(me.id) : null
       if (isOutgoing && selfId && chatId === selfId) {
@@ -242,40 +248,116 @@ export class TelegramUserbotTransport implements Transport {
 
     if (payload === null || !this.messageHandler) return
 
-    // Fire-and-forget log
     this.appendLog({ direction: 'in', chatId, text: payload, messageId: msg.id })
 
-    // Per-chat queue: if already processing this chat, enqueue and return
-    let entry = this.chatQueues.get(chatId)
+    // Per-session queue (not per-chat) — different topics in the same forum
+    // run independently. Same topic is still serialized so the agent doesn't
+    // race against itself.
+    let entry = this.chatQueues.get(ctx.sessionId)
     if (!entry) {
       entry = { queue: [], processing: false }
-      this.chatQueues.set(chatId, entry)
+      this.chatQueues.set(ctx.sessionId, entry)
     }
     if (entry.processing) {
-      entry.queue.push({ text: payload })
+      entry.queue.push({ text: payload, ctx })
       return
     }
     entry.processing = true
-    const processNext = async (text: string) => {
+    const processNext = async (text: string, mctx: MessageContext) => {
       try {
-        await this.messageHandler!(text, chatId)
+        await this.messageHandler!(text, mctx)
       } catch (err) {
         console.error('[telegram-userbot] messageHandler error:', err)
       }
       const next = entry!.queue.shift()
       if (next) {
-        await processNext(next.text)
+        await processNext(next.text, next.ctx)
       } else {
         entry!.processing = false
       }
     }
-    await processNext(payload)
+    await processNext(payload, ctx)
   }
 
-  private async sendLongMessage(peer: string, text: string): Promise<void> {
+  /**
+   * Recover the (sessionId, sender, chat) context from a raw MTProto message.
+   * Forum topic detection looks at msg.replyTo.replyToTopId / forumTopic.
+   */
+  private async buildContext(msg: Api.Message, chatId: string): Promise<MessageContext> {
+    // Chat kind — peerId tells us channel/chat/user, then we may need to
+    // distinguish supergroup vs broadcast channel via the chat object.
+    let chatKind: ChatKind = 'private'
+    let title: string | undefined
+    let isForum = false
+    try {
+      const peer = msg.peerId as { className?: string } | undefined
+      if (peer?.className === 'PeerChat') {
+        chatKind = 'group'
+      } else if (peer?.className === 'PeerChannel') {
+        chatKind = 'supergroup'
+        // Look up channel info to detect forum / get title.
+        try {
+          const chat = await msg.getChat?.()
+          if (chat) {
+            // @ts-expect-error gramjs runtime
+            title = chat.title
+            // @ts-expect-error gramjs runtime
+            if (chat.broadcast === true) chatKind = 'channel'
+            // @ts-expect-error gramjs runtime
+            if (chat.forum === true) isForum = true
+          }
+        } catch {}
+      }
+    } catch {}
+
+    // Topic id — only meaningful when the chat is a forum supergroup.
+    let threadId: number | undefined
+    if (isForum) {
+      const replyTo = msg.replyTo as { replyToTopId?: number; replyToMsgId?: number; forumTopic?: boolean } | undefined
+      if (replyTo?.replyToTopId) {
+        threadId = replyTo.replyToTopId
+      } else if (replyTo?.forumTopic && replyTo?.replyToMsgId) {
+        // The first message in a topic — the reply target IS the topic id.
+        threadId = replyTo.replyToMsgId
+      }
+    }
+
+    // Sender — only present in groups; in private chats fromId is undefined.
+    let sender: MessageSender | undefined
+    const fromId = msg.fromId as { userId?: number | string } | undefined
+    if (fromId?.userId !== undefined) {
+      const userIdStr = String(fromId.userId)
+      sender = { id: userIdStr }
+      try {
+        const senderObj = await msg.getSender?.()
+        if (senderObj) {
+          // @ts-expect-error gramjs runtime
+          const first = senderObj.firstName
+          // @ts-expect-error gramjs runtime
+          const last = senderObj.lastName
+          // @ts-expect-error gramjs runtime
+          const username = senderObj.username
+          sender.displayName = [first, last].filter(Boolean).join(' ') || undefined
+          sender.username = username || undefined
+        }
+      } catch {}
+    }
+
+    const sessionId = buildSessionId({
+      chatId,
+      chatKind,
+      threadId,
+      userId: sender?.id,
+    })
+
+    const chat: MessageChat = { id: chatId, kind: chatKind, title, threadId }
+    return { sessionId, sender, chat }
+  }
+
+  private async sendLongMessage(peer: string, text: string, topMsgId?: number): Promise<void> {
     const MAX_LENGTH = 4096
     if (text.length <= MAX_LENGTH) {
-      await this.safeSend(peer, text)
+      await this.safeSend(peer, text, topMsgId)
       return
     }
     const chunks: string[] = []
@@ -289,12 +371,15 @@ export class TelegramUserbotTransport implements Transport {
       }
     }
     if (current) chunks.push(current)
-    for (const chunk of chunks) await this.safeSend(peer, chunk)
+    for (const chunk of chunks) await this.safeSend(peer, chunk, topMsgId)
   }
 
-  private async safeSend(peer: string, text: string): Promise<void> {
+  private async safeSend(peer: string, text: string, topMsgId?: number): Promise<void> {
     try {
-      await this.client.sendMessage(peer, { message: text })
+      // Send into a forum topic by passing replyTo with the topic's top message id.
+      const opts: { message: string; replyTo?: number } = { message: text }
+      if (topMsgId) opts.replyTo = topMsgId
+      await this.client.sendMessage(peer, opts)
     } catch (err) {
       console.error(`[telegram-userbot] send failed to ${peer}:`, err)
     }

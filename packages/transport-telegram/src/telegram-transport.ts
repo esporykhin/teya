@@ -1,17 +1,24 @@
 /**
- * @description Telegram bot transport — grammy, long polling, message splitting
+ * @description Telegram bot transport — grammy, long polling, message splitting,
+ *  per-topic / per-author session routing for groups and forum supergroups.
  * @exports TelegramTransport
  */
 import { Bot } from 'grammy'
-import type { Transport, AgentEvent } from '@teya/core'
+import type { Transport, AgentEvent, MessageContext, MessageSender, MessageChat } from '@teya/core'
+import { buildSessionId, parseSessionId, type ChatKind } from './session-id.js'
+
+interface SessionStats {
+  turns: number
+  cost: number
+  startTime: number
+}
 
 export class TelegramTransport implements Transport {
   private bot: Bot
-  private messageHandler: ((message: string, sessionId: string) => void) | null = null
+  private messageHandler: ((message: string, ctx: MessageContext) => void) | null = null
   private cancelHandler: ((sessionId: string) => void) | null = null
-  private responseBuffers: Map<string, string> = new Map()  // chatId -> accumulated text
-  private allowedChatIds?: Set<number>  // whitelist, if set
-  private sessionStats: Map<string, { turns: number; cost: number; startTime: number }> = new Map()
+  private allowedChatIds?: Set<number>
+  private sessionStats: Map<string, SessionStats> = new Map()
   ready = true
 
   constructor(config: { token: string; allowedChatIds?: number[] }) {
@@ -21,7 +28,7 @@ export class TelegramTransport implements Transport {
     }
   }
 
-  onMessage(handler: (message: string, sessionId: string) => void): void {
+  onMessage(handler: (message: string, ctx: MessageContext) => void): void {
     this.messageHandler = handler
   }
 
@@ -30,12 +37,17 @@ export class TelegramTransport implements Transport {
   }
 
   async send(event: AgentEvent, sessionId: string): Promise<void> {
-    const chatId = sessionId  // sessionId = chatId for telegram
+    // Decode the routing parameters back from the composite session id.
+    // This is the only way `send()` knows which Telegram thread to write to,
+    // since the Transport interface only carries the opaque sessionId.
+    const parsed = parseSessionId(sessionId)
+    if (!parsed) return
+    const chatId = Number(parsed.chatId)
+    const threadId = parsed.threadId
 
     switch (event.type) {
       case 'thinking_start':
-        // Send typing indicator
-        try { await this.bot.api.sendChatAction(Number(chatId), 'typing') } catch {}
+        try { await this.bot.api.sendChatAction(chatId, 'typing', threadId ? { message_thread_id: threadId } : undefined) } catch {}
         break
 
       case 'thinking_end': {
@@ -46,123 +58,109 @@ export class TelegramTransport implements Transport {
       }
 
       case 'response': {
-        // Send the full response, split if > 4096 chars
         const text = event.content || '(empty response)'
-        await this.sendLongMessage(Number(chatId), text)
+        await this.sendLongMessage(chatId, text, threadId)
         break
       }
 
-      case 'tool_start':
-        // Optional: show what tool is being used
-        // Don't spam — only show for slow tools
-        break
-
-      case 'tool_result':
-        // Don't show raw tool results to user
-        break
-
       case 'tool_error':
-        await this.safeSend(Number(chatId), `Tool error: ${event.tool} — ${event.error}`)
+        await this.safeSend(chatId, `Tool error: ${event.tool} — ${event.error}`, threadId)
         break
 
       case 'error':
-        await this.safeSend(Number(chatId), `Error (${event.phase}): ${event.error}`)
+        await this.safeSend(chatId, `Error (${event.phase}): ${event.error}`, threadId)
         break
 
       case 'cancelled':
-        await this.safeSend(Number(chatId), 'Cancelled.')
+        await this.safeSend(chatId, 'Cancelled.', threadId)
         break
 
       case 'max_turns_reached':
-        await this.safeSend(Number(chatId), `Reached max turns (${event.turns}).`)
+        await this.safeSend(chatId, `Reached max turns (${event.turns}).`, threadId)
         break
 
       case 'budget_exceeded':
-        await this.safeSend(Number(chatId), `Budget exceeded ($${event.cost.toFixed(4)}).`)
+        await this.safeSend(chatId, `Budget exceeded ($${event.cost.toFixed(4)}).`, threadId)
         break
 
       case 'plan_proposed': {
         const planText = event.steps
-          .map((s: { description: string; tools?: string[]; estimatedCost?: number }, i: number) => `${i + 1}. ${s.description}`)
+          .map((s, i) => `${i + 1}. ${s.description}`)
           .join('\n')
-        await this.safeSend(Number(chatId), `Plan:\n${planText}`)
+        await this.safeSend(chatId, `Plan:\n${planText}`, threadId)
         break
       }
 
       case 'ask_user':
-        await this.safeSend(Number(chatId), event.question)
+        await this.safeSend(chatId, event.question, threadId)
         break
 
       case 'intermediate_response':
-        await this.safeSend(Number(chatId), event.content)
+        await this.safeSend(chatId, event.content, threadId)
         break
     }
   }
 
   async start(): Promise<void> {
-    // Handle text messages
     this.bot.on('message:text', async (ctx) => {
       const chatId = ctx.chat.id
       const text = ctx.message.text.trim()
 
-      // Whitelist check
       if (this.allowedChatIds && !this.allowedChatIds.has(chatId)) {
         await ctx.reply('Access denied.')
         return
       }
 
-      // Commands
+      const route = this.routeFor(ctx)
+
+      const threadId = route.chat?.threadId
+
+      // Built-in commands handled at transport level (no async leak to agent).
       if (text === '/stop') {
-        this.cancelHandler?.(String(chatId))
-        await ctx.reply('Stopping current task...')
-        return
-      }
-      if (text === '/new') {
-        await ctx.reply('New session started.')
+        this.cancelHandler?.(route.sessionId)
+        await this.safeSend(chatId, 'Stopping current task...', threadId)
         return
       }
       if (text === '/start') {
-        await ctx.reply('Teya Agent ready. Send me a message.')
+        await this.safeSend(chatId, 'Teya Agent ready. Send me a message.', threadId)
         return
       }
       if (text === '/status') {
-        const stats = this.sessionStats.get(String(chatId))
+        const stats = this.sessionStats.get(route.sessionId)
         if (stats) {
           const elapsed = Math.floor((Date.now() - stats.startTime) / 1000)
-          await ctx.reply(`Session: ${elapsed}s, ${stats.turns} turns`)
+          await this.safeSend(chatId, `Session ${route.sessionId} — ${elapsed}s, ${stats.turns} turns`, threadId)
         } else {
-          await ctx.reply('No active session.')
+          await this.safeSend(chatId, `No active session for ${route.sessionId}`, threadId)
         }
         return
       }
 
-      // Regular message
+      // /clear and /compact are handled centrally in the CLI message
+      // intercept (it has access to the session store). Just pass them through.
       if (this.messageHandler) {
-        this.messageHandler(text, String(chatId))
+        this.messageHandler(text, route)
       }
     })
 
-    // Handle photos
     this.bot.on('message:photo', async (ctx) => {
       const chatId = ctx.chat.id
       if (this.allowedChatIds && !this.allowedChatIds.has(chatId)) return
-
+      const route = this.routeFor(ctx)
       const caption = ctx.message.caption || 'User sent a photo'
-      // For now, just treat as text message with description
       if (this.messageHandler) {
-        this.messageHandler(`[Photo received: ${caption}]`, String(chatId))
+        this.messageHandler(`[Photo received: ${caption}]`, route)
       }
     })
 
-    // Handle documents
     this.bot.on('message:document', async (ctx) => {
       const chatId = ctx.chat.id
       if (this.allowedChatIds && !this.allowedChatIds.has(chatId)) return
-
+      const route = this.routeFor(ctx)
       const fileName = ctx.message.document?.file_name || 'unknown'
       const caption = ctx.message.caption || ''
       if (this.messageHandler) {
-        this.messageHandler(`[Document received: ${fileName}${caption ? ' — ' + caption : ''}]`, String(chatId))
+        this.messageHandler(`[Document received: ${fileName}${caption ? ' — ' + caption : ''}]`, route)
       }
     })
 
@@ -174,14 +172,52 @@ export class TelegramTransport implements Transport {
     await this.bot.stop()
   }
 
-  private async sendLongMessage(chatId: number, text: string): Promise<void> {
+  /**
+   * Build the per-message MessageContext (sessionId + sender + chat metadata)
+   * from a grammy update. This is the single place that decides "what's a
+   * session" in Telegram — see session-id.ts for the encoding rules.
+   */
+  private routeFor(ctx: {
+    chat: { id: number; type: string; title?: string }
+    from?: { id: number; first_name?: string; last_name?: string; username?: string }
+    message: { message_thread_id?: number }
+  }): MessageContext {
+    const chatKind = (ctx.chat.type as ChatKind) || 'private'
+    const threadId = ctx.message.message_thread_id
+    const userId = ctx.from?.id
+
+    const sessionId = buildSessionId({
+      chatId: ctx.chat.id,
+      chatKind,
+      threadId,
+      userId,
+    })
+
+    const sender: MessageSender | undefined = ctx.from
+      ? {
+          id: String(ctx.from.id),
+          displayName: [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(' ') || undefined,
+          username: ctx.from.username || undefined,
+        }
+      : undefined
+
+    const chat: MessageChat = {
+      id: String(ctx.chat.id),
+      kind: chatKind,
+      title: ctx.chat.title,
+      threadId,
+    }
+
+    return { sessionId, sender, chat }
+  }
+
+  private async sendLongMessage(chatId: number, text: string, threadId?: number): Promise<void> {
     const MAX_LENGTH = 4096
     if (text.length <= MAX_LENGTH) {
-      await this.safeSend(chatId, text)
+      await this.safeSend(chatId, text, threadId)
       return
     }
 
-    // Split by paragraphs, then by lines, then by characters
     const chunks: string[] = []
     let current = ''
     for (const line of text.split('\n')) {
@@ -195,17 +231,17 @@ export class TelegramTransport implements Transport {
     if (current) chunks.push(current)
 
     for (const chunk of chunks) {
-      await this.safeSend(chatId, chunk)
+      await this.safeSend(chatId, chunk, threadId)
     }
   }
 
-  private async safeSend(chatId: number, text: string): Promise<void> {
+  private async safeSend(chatId: number, text: string, threadId?: number): Promise<void> {
+    const opts = threadId ? { message_thread_id: threadId } : undefined
     try {
-      await this.bot.api.sendMessage(chatId, text, { parse_mode: 'Markdown' })
+      await this.bot.api.sendMessage(chatId, text, { parse_mode: 'Markdown', ...opts })
     } catch {
-      // Markdown parse failed — retry without parse_mode
       try {
-        await this.bot.api.sendMessage(chatId, text)
+        await this.bot.api.sendMessage(chatId, text, opts)
       } catch (err) {
         console.error(`Failed to send message to ${chatId}:`, err)
       }
