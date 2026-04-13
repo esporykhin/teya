@@ -8,7 +8,7 @@ import { readFile, writeFile, mkdir } from 'fs/promises'
 import { join } from 'path'
 import { agentLoop, buildSystemPrompt } from '@teya/core'
 import { loadSkills, buildSkillsMetadata, buildActiveSkillContent } from '@teya/skills'
-import type { Message, LLMProvider, MessageContext } from '@teya/core'
+import type { Message, LLMProvider, MessageContext, Transport } from '@teya/core'
 import { openrouter, ollama, codex, withToolAdapter, fallback } from '@teya/providers'
 import { createToolRegistry, registerBuiltins, createMCPManager, createDynamicToolLoader, closeBrowser, initWorkspace, getWorkspaceInfo } from '@teya/tools'
 import { AgentRegistry, createDelegateTool } from '@teya/orchestrator'
@@ -569,31 +569,26 @@ async function main() {
    * the session by id and resume, or create a new one if missing.
    */
   async function getOrLoadRoute(routeId: string | undefined): Promise<RouteState> {
-    // Single-session "anchor" for CLI mode — anchored on the latest row
-    // at startup. For Telegram, every distinct routeId becomes its own slot.
+    // Route key = stable transport-level identifier (chatId, topic, user).
+    // For CLI mode there's a single "__cli__" slot.
     const key = routeId || '__cli__'
     const cached = routes.get(key)
     if (cached) return cached
 
+    // Resolve to the most recent SESSION for this route. Session IDs are
+    // random UUIDs; the route is a separate column. On /clear, a fresh
+    // UUID-id session gets created against the same route, and this lookup
+    // returns the new one on the next message. getLatestForRoute also
+    // filters out entries older than 24h to avoid resuming stale state.
     let session: SessionState | null = null
     if (routeId) {
-      // Try to find a saved session whose id contains the routeId in its
-      // metadata (we use routeId as session.id directly when creating).
-      session = await sessionStore.load(routeId)
+      session = await sessionStore.getLatestForRoute(routeId)
     } else {
       session = await sessionStore.getLatest()
     }
 
     if (!session) {
-      // Create a new row. For Telegram routes the row id IS the routeId,
-      // so resuming on the next message is O(1).
-      session = sessionStore.createSession('default', transportType)
-      if (routeId) {
-        // Replace the auto-generated UUID with the routeId so the saved
-        // session is keyed by route, not by random UUID.
-        session = { ...session, id: routeId }
-        await sessionStore.save(session)
-      }
+      session = sessionStore.createSession('default', transportType, routeId)
     }
 
     const state: RouteState = {
@@ -678,17 +673,14 @@ async function main() {
     transport: transportType,
   })
 
-  /** Reset a single route — used by /clear. Removes the in-memory entry and
-   *  creates a fresh empty session for the same routeId. */
+  /** Reset a single route — used by /clear. Wipes the in-memory entry and
+   *  creates a fresh session (new random UUID) bound to the same route.
+   *  The previous session row stays in the DB for history; getLatestForRoute
+   *  will now return this new one. */
   async function resetRoute(routeId: string | undefined): Promise<RouteState> {
     const key = routeId || '__cli__'
     routes.delete(key)
-    // Force creation of a fresh session row for this routeId.
-    let session = sessionStore.createSession('default', transportType)
-    if (routeId) {
-      session = { ...session, id: routeId }
-      await sessionStore.save(session)
-    }
+    const session = sessionStore.createSession('default', transportType, routeId)
     const state: RouteState = {
       session,
       history: [],
@@ -793,6 +785,51 @@ async function main() {
 
   let abortController: AbortController | null = null
 
+  // ── Model switching helper ────────────────────────────────────────────────
+  // Shared by /model readline flow (CLI) and /model inline-keyboard flow (Telegram).
+  async function switchModel(
+    newModel: string,
+    newType?: 'openrouter' | 'ollama' | 'codex',
+  ): Promise<void> {
+    model = newModel
+    const effectiveType = newType || providerType
+    if (effectiveType === 'openrouter') {
+      provider = openrouter({ model, apiKey })
+    } else if (effectiveType === 'ollama') {
+      provider = withToolAdapter(ollama({ model }))
+    } else if (effectiveType === 'codex') {
+      provider = codex({ model: model || undefined, cwd: process.cwd() })
+    }
+    providerType = effectiveType
+    const savedCfg = await loadSavedConfig()
+    savedCfg.model = model
+    savedCfg.provider = effectiveType
+    await saveConfig(savedCfg)
+    // Refresh tracer with the new capabilities so cost estimation stays accurate.
+    // The Proxy around capabilities is already live — nothing else to touch.
+  }
+
+  /**
+   * Per-route pending-input state for multi-step flows invoked via inline
+   * keyboard. Right now used for "/model → OpenRouter → send model name"
+   * (user clicks button, then next text message is interpreted as the
+   * model name and switched in). Keyed by routeKey.
+   */
+  type PendingKind = { kind: 'openrouter-model' }
+  const pendingInput = new Map<string, PendingKind>()
+
+  /** Fetch the list of locally-installed Ollama models (for /model → Local). */
+  async function fetchOllamaModels(): Promise<string[]> {
+    try {
+      const r = await fetch('http://localhost:11434/api/tags')
+      if (!r.ok) return []
+      const json = (await r.json()) as { models?: Array<{ name: string }> }
+      return (json.models || []).map(m => m.name)
+    } catch {
+      return []
+    }
+  }
+
   if (!isTelegramAny) {
     (transport as CLITransport).onCommand(async (command: string) => {
       switch (command) {
@@ -860,17 +897,7 @@ async function main() {
             })
           })
           if (newModel) {
-            model = newModel
-            if (providerType === 'openrouter') {
-              provider = openrouter({ model, apiKey })
-            } else if (providerType === 'ollama') {
-              provider = withToolAdapter(ollama({ model }))
-            } else if (providerType === 'codex') {
-              provider = codex({ model: model || undefined, cwd: process.cwd() })
-            }
-            const saved = await loadSavedConfig()
-            saved.model = model
-            await saveConfig(saved)
+            await switchModel(newModel)
             console.log(`\x1b[32mModel changed to: ${model}\x1b[0m\n`)
           } else {
             console.log('')
@@ -970,8 +997,31 @@ async function main() {
     const idCtx = resolveIdentity(ctx)
 
     await runWithIdentity(idCtx, async () => {
-      // Slash command intercept — works for ALL transports.
       const trimmed = message.trim()
+      const pendingKey = routeKey || '__cli__'
+
+      // Pending-input interception — if we're mid-flow waiting for the user
+      // to type a model name (after clicking /model → OpenRouter), treat
+      // the next non-slash message as the model id and switch.
+      if (pendingInput.has(pendingKey) && !trimmed.startsWith('/')) {
+        const pending = pendingInput.get(pendingKey)!
+        pendingInput.delete(pendingKey)
+        if (pending.kind === 'openrouter-model') {
+          try {
+            await switchModel(trimmed, 'openrouter')
+            const note = `✓ Model switched to \`${trimmed}\` (OpenRouter)`
+            if (isTelegramAny) transport.send({ type: 'response', content: note }, ctx.sessionId)
+            else { console.log(note); (transport as CLITransport).prompt() }
+          } catch (err) {
+            const note = `Failed to switch model: ${(err as Error).message}`
+            if (isTelegramAny) transport.send({ type: 'response', content: note }, ctx.sessionId)
+            else { console.log(note); (transport as CLITransport).prompt() }
+          }
+          return
+        }
+      }
+
+      // Slash command intercept — works for ALL transports.
       if (trimmed.startsWith('/')) {
         const cmd = trimmed.split(/\s+/)[0]
         if (cmd === '/clear' || cmd === '/new') {
@@ -994,9 +1044,48 @@ async function main() {
         if (cmd === '/status') {
           const cur = await getOrLoadRoute(routeKey)
           const tokens = Math.ceil(cur.history.reduce((s, m) => s + (m.content?.length || 0), 0) / 3.5)
-          const note = `session=${cur.session.id.slice(0, 8)} messages=${cur.history.length} ~tokens=${tokens} turns=${cur.session.totalTurns} cost=$${(cur.session.totalCost || 0).toFixed(4)} identity=${idCtx.identity.kind}/${idCtx.scopeId}`
+          const note = `session=${cur.session.id.slice(0, 8)} messages=${cur.history.length} ~tokens=${tokens} turns=${cur.session.totalTurns} cost=$${(cur.session.totalCost || 0).toFixed(4)} identity=${idCtx.identity.kind}/${idCtx.scopeId} model=${providerType}/${model}`
           if (isTelegramAny) transport.send({ type: 'response', content: note }, ctx.sessionId)
           else { console.log(`\x1b[90m${note}\x1b[0m\n`); (transport as CLITransport).prompt() }
+          return
+        }
+        // /model — interactive for Telegram, legacy readline for CLI
+        // Supports `/model <name>` direct switch, bypassing the keyboard.
+        if (cmd === '/model') {
+          const arg = trimmed.slice('/model'.length).trim()
+          if (arg) {
+            try {
+              await switchModel(arg)
+              const note = `✓ Model → \`${arg}\``
+              if (isTelegramAny) transport.send({ type: 'response', content: note }, ctx.sessionId)
+              else { console.log(note); (transport as CLITransport).prompt() }
+            } catch (err) {
+              const note = `Failed: ${(err as Error).message}`
+              if (isTelegramAny) transport.send({ type: 'response', content: note }, ctx.sessionId)
+              else { console.log(note); (transport as CLITransport).prompt() }
+            }
+            return
+          }
+          // No arg — show interactive picker for Telegram, let CLI
+          // commandHandler handle it via readline prompt.
+          const t = transport as Transport
+          if (isTelegramAny && t.sendKeyboard) {
+            await t.sendKeyboard(
+              ctx.sessionId,
+              `Текущая: \`${providerType}/${model}\`\n\nВыбери источник:`,
+              [
+                [
+                  { label: '📦 Локальные (Ollama)', callbackData: 'model:src:local' },
+                  { label: '☁️ OpenRouter', callbackData: 'model:src:or' },
+                ],
+              ],
+            )
+            return
+          }
+          // CLI — fall through to CLITransport's commandHandler path below
+          // (we're NOT in the onMessage intercept for CLI because CLI
+          // routes slash commands via onCommand). This return exists for
+          // consistency; shouldn't be reached.
           return
         }
       }
@@ -1132,6 +1221,72 @@ Rules:
 
   transport.onCancel((_sessionId) => {
     abortController?.abort()
+  })
+
+  // Inline keyboard callbacks (Telegram). CLI transport has no callbacks so
+  // this handler is registered only if the transport supports it. All flows
+  // are prefixed with `model:` so adding more categories later stays clean.
+  const transportAny = transport as Transport
+  transportAny.onCallback?.(async (data: string, ctx: MessageContext) => {
+    const pendingKey = isBackgroundProcess ? ctx.sessionId : '__cli__'
+
+    if (data === 'model:src:local') {
+      const models = await fetchOllamaModels()
+      if (models.length === 0) {
+        transport.send(
+          { type: 'response', content: 'Локальные модели не найдены. Запусти Ollama и установи модель: `ollama pull llama3.2`' },
+          ctx.sessionId,
+        )
+        return
+      }
+      const buttons = models.slice(0, 20).map(name => [{
+        label: `🦙 ${name}`,
+        callbackData: `model:pick:ollama:${name}`,
+      }])
+      await transportAny.sendKeyboard?.(ctx.sessionId, `Выбери Ollama-модель (${models.length}):`, buttons)
+      return
+    }
+
+    if (data === 'model:src:or') {
+      pendingInput.set(pendingKey, { kind: 'openrouter-model' })
+      transport.send(
+        {
+          type: 'response',
+          content:
+            'Отправь следующим сообщением название модели на OpenRouter. Примеры:\n' +
+            '• `qwen/qwen3.6-plus`\n' +
+            '• `anthropic/claude-3.5-haiku`\n' +
+            '• `anthropic/claude-3.5-sonnet`\n' +
+            '• `openai/gpt-4o-mini`\n' +
+            '• `google/gemini-2.5-flash`\n' +
+            '• `google/gemma-4-31b-it`',
+        },
+        ctx.sessionId,
+      )
+      return
+    }
+
+    if (data.startsWith('model:pick:')) {
+      const rest = data.slice('model:pick:'.length)
+      // Format: "<type>:<model-with-possibly-slashes>"
+      const firstColon = rest.indexOf(':')
+      if (firstColon === -1) return
+      const type = rest.slice(0, firstColon) as 'ollama' | 'openrouter'
+      const modelName = rest.slice(firstColon + 1)
+      try {
+        await switchModel(modelName, type)
+        transport.send(
+          { type: 'response', content: `✓ Model → \`${modelName}\` (${type})` },
+          ctx.sessionId,
+        )
+      } catch (err) {
+        transport.send(
+          { type: 'response', content: `Failed: ${(err as Error).message}` },
+          ctx.sessionId,
+        )
+      }
+      return
+    }
   })
 
   // Auto-bootstrap the scheduler daemon. The daemon registers itself in

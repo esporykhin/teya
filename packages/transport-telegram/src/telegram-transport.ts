@@ -3,8 +3,8 @@
  *  per-topic / per-author session routing for groups and forum supergroups.
  * @exports TelegramTransport
  */
-import { Bot } from 'grammy'
-import type { Transport, AgentEvent, MessageContext, MessageSender, MessageChat } from '@teya/core'
+import { Bot, InlineKeyboard } from 'grammy'
+import type { Transport, AgentEvent, MessageContext, MessageSender, MessageChat, KeyboardButton } from '@teya/core'
 import { buildSessionId, parseSessionId, type ChatKind } from './session-id.js'
 
 interface SessionStats {
@@ -17,6 +17,7 @@ export class TelegramTransport implements Transport {
   private bot: Bot
   private messageHandler: ((message: string, ctx: MessageContext) => void) | null = null
   private cancelHandler: ((sessionId: string) => void) | null = null
+  private callbackHandler: ((data: string, ctx: MessageContext) => void) | null = null
   private allowedChatIds?: Set<number>
   private sessionStats: Map<string, SessionStats> = new Map()
   ready = true
@@ -34,6 +35,32 @@ export class TelegramTransport implements Transport {
 
   onCancel(handler: (sessionId: string) => void): void {
     this.cancelHandler = handler
+  }
+
+  onCallback(handler: (data: string, ctx: MessageContext) => void): void {
+    this.callbackHandler = handler
+  }
+
+  async sendKeyboard(sessionId: string, text: string, buttons: KeyboardButton[][]): Promise<void> {
+    const parsed = parseSessionId(sessionId)
+    if (!parsed) return
+    const chatId = Number(parsed.chatId)
+    const threadId = parsed.threadId
+
+    const kb = new InlineKeyboard()
+    for (const row of buttons) {
+      for (const btn of row) kb.text(btn.label, btn.callbackData)
+      kb.row()
+    }
+
+    const opts: Record<string, unknown> = { reply_markup: kb }
+    if (threadId) opts.message_thread_id = threadId
+
+    try {
+      await this.bot.api.sendMessage(chatId, text, opts as any)
+    } catch (err) {
+      console.error(`Failed to send keyboard to ${chatId}:`, err)
+    }
   }
 
   async send(event: AgentEvent, sessionId: string): Promise<void> {
@@ -162,6 +189,33 @@ export class TelegramTransport implements Transport {
       if (this.messageHandler) {
         this.messageHandler(`[Document received: ${fileName}${caption ? ' — ' + caption : ''}]`, route)
       }
+    })
+
+    // Inline-keyboard button clicks. Build a MessageContext from the
+    // underlying message so the CLI handler can route the callback to
+    // the right session / identity / route.
+    this.bot.on('callback_query:data', async (ctx) => {
+      const chat = ctx.chat
+      if (!chat) {
+        await ctx.answerCallbackQuery().catch(() => {})
+        return
+      }
+      if (this.allowedChatIds && !this.allowedChatIds.has(chat.id)) {
+        await ctx.answerCallbackQuery({ text: 'Access denied' }).catch(() => {})
+        return
+      }
+      // Build a synthetic ctx with the same routeFor logic — callback
+      // queries carry the originating message, so we can reuse its
+      // thread id for forum supergroups.
+      const cbMessage = ctx.callbackQuery.message
+      const route = this.routeFor({
+        chat: { id: chat.id, type: chat.type, title: 'title' in chat ? chat.title : undefined },
+        from: ctx.from,
+        message: { message_thread_id: cbMessage?.message_thread_id },
+      })
+      // Dismiss the "loading" spinner on the button immediately.
+      await ctx.answerCallbackQuery().catch(() => {})
+      this.callbackHandler?.(ctx.callbackQuery.data, route)
     })
 
     console.log('Telegram bot starting...')

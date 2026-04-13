@@ -53,11 +53,33 @@ export class SessionStore {
       CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
       CREATE INDEX IF NOT EXISTS idx_sessions_agent ON sessions(agent_id);
     `)
+
+    // Route is the stable transport-level identifier (e.g. "tg:112833890")
+    // that one or MORE sessions may belong to — per /clear, a fresh session
+    // with a new UUID is created against the same route. Added in a
+    // separate statement so existing DBs get the column via idempotent ALTER.
+    try {
+      this.db.exec(`ALTER TABLE sessions ADD COLUMN route TEXT`)
+    } catch {
+      // Column already exists — ignore.
+    }
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_sessions_route ON sessions(route, updated_at DESC)`)
+
+    // One-time backfill: for existing Telegram sessions created before the
+    // route column existed, id was set to the composite route string (e.g.
+    // "tg:112833890"). Copy it into the new column so getLatestForRoute
+    // finds them. Idempotent — only touches rows where route is still NULL.
+    this.db.exec(`
+      UPDATE sessions
+        SET route = id
+        WHERE route IS NULL
+          AND id LIKE 'tg:%'
+    `)
   }
 
   // ── Create / Save ──────────────────────────────────────────────────────
 
-  createSession(agentId: string = 'default', transport: string = 'cli'): SessionState {
+  createSession(agentId: string = 'default', transport: string = 'cli', route?: string): SessionState {
     const now = new Date()
     const session: SessionState = {
       id: randomUUID(),
@@ -73,12 +95,13 @@ export class SessionStore {
       agentsUsed: [],
       topics: [],
       transport,
+      route,
     }
 
     this.db.prepare(`
-      INSERT INTO sessions (id, agent_id, transport, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(session.id, agentId, transport, now.toISOString(), now.toISOString())
+      INSERT INTO sessions (id, agent_id, transport, route, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(session.id, agentId, transport, route || null, now.toISOString(), now.toISOString())
 
     return session
   }
@@ -101,8 +124,8 @@ export class SessionStore {
     // Update index
     this.db.prepare(`
       INSERT OR REPLACE INTO sessions
-        (id, agent_id, summary, first_message, topics, tools_used, agents_used, task_ids, transport, total_cost, total_turns, message_count, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, agent_id, summary, first_message, topics, tools_used, agents_used, task_ids, transport, route, total_cost, total_turns, message_count, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       session.id,
       session.agentId,
@@ -113,6 +136,7 @@ export class SessionStore {
       JSON.stringify(session.agentsUsed || []),
       JSON.stringify(session.taskIds || []),
       session.transport || 'cli',
+      session.route || null,
       session.totalCost,
       session.totalTurns,
       session.messages.length,
@@ -155,6 +179,34 @@ export class SessionStore {
     if (!row) return null
 
     // Only return if less than 24 hours old
+    const age = Date.now() - new Date(row.updated_at).getTime()
+    if (age > 24 * 60 * 60 * 1000) return null
+
+    let messages: Message[] = []
+    try {
+      const data = await readFile(join(this.messagesDir, `${row.id}.json`), 'utf-8')
+      messages = JSON.parse(data)
+    } catch {}
+
+    return this.rowToSession(row, messages)
+  }
+
+  /**
+   * Find the most recent session for a given transport-level route
+   * (e.g. "tg:112833890"). Used by the CLI's route resolver to resume
+   * the active session of a Telegram chat/topic across bot restarts
+   * WITHOUT pinning the session.id to the route.
+   *
+   * Returns null if the route has never been seen or the latest session
+   * is older than 24 hours (stale resumes are dangerous — they can pull
+   * yesterday's context into today's conversation).
+   */
+  async getLatestForRoute(route: string): Promise<SessionState | null> {
+    const row = this.db.prepare(`
+      SELECT * FROM sessions WHERE route = ? ORDER BY updated_at DESC LIMIT 1
+    `).get(route) as any
+    if (!row) return null
+
     const age = Date.now() - new Date(row.updated_at).getTime()
     if (age > 24 * 60 * 60 * 1000) return null
 
@@ -273,6 +325,7 @@ export class SessionStore {
       agentsUsed: JSON.parse(row.agents_used || '[]'),
       topics: JSON.parse(row.topics || '[]'),
       transport: row.transport,
+      route: row.route || undefined,
     }
   }
 }

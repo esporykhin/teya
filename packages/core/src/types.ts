@@ -298,6 +298,16 @@ export interface SessionState {
   firstMessage?: string
   /** Transport: 'cli' | 'telegram' | 'api' */
   transport?: string
+  /**
+   * Stable route identifier — survives /clear. One route maps to a
+   * chain of sessions over time (a new UUID-id session is created
+   * on every /clear against the same route). Examples:
+   *   - Telegram private chat: "tg:112833890"
+   *   - Telegram forum topic:  "tg:-1001234:t42"
+   *   - Telegram group member: "tg:-1001234:u99"
+   *   - CLI:                   "cli" (singleton)
+   */
+  route?: string
 }
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -414,6 +424,12 @@ export interface MessageChat {
   threadTitle?: string
 }
 
+export interface KeyboardButton {
+  label: string
+  /** Opaque payload delivered back via onCallback when the user clicks. */
+  callbackData: string
+}
+
 export interface Transport {
   onMessage(handler: (message: string, ctx: MessageContext) => void): void
   send(event: AgentEvent, sessionId: string): void | Promise<void>
@@ -421,6 +437,15 @@ export interface Transport {
   start(): Promise<void>
   stop(): Promise<void>
   readonly ready: boolean
+
+  /** Optional — inline keyboards for transports that support them (Telegram).
+   *  Caller should fall back to plain text when this is absent (CLI). */
+  sendKeyboard?(sessionId: string, text: string, buttons: KeyboardButton[][]): Promise<void>
+
+  /** Optional — receive button-press callbacks. The handler gets the
+   *  opaque callbackData from the button and a MessageContext describing
+   *  which route the click came from. */
+  onCallback?(handler: (data: string, ctx: MessageContext) => void): void
 }
 
 // ─── Helper ───────────────────────────────────────────────────────────────────
