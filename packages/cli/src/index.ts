@@ -1123,10 +1123,12 @@ async function main() {
       // Resolve the route — per-topic / per-author isolated session state.
       const route = await getOrLoadRoute(routeKey)
 
-      // Vision model auto-switch when images are attached
+      // Vision model auto-switch when images are attached. Skipped if the
+      // current provider already handles vision natively (claude-code, etc.)
+      // — otherwise we'd hijack the turn away from the user's chosen agent.
       let activeProvider = provider
       const images = ctx.images
-      if (images && images.length > 0) {
+      if (images && images.length > 0 && !provider.capabilities.vision) {
         const visionMap: Record<string, string> = {
           'z-ai/glm-5-turbo': 'z-ai/glm-5v-turbo',
           'z-ai/glm-5': 'z-ai/glm-5v-turbo',

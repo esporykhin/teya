@@ -3,6 +3,9 @@
  * @exports claudeCode
  */
 import { spawn } from 'child_process'
+import { writeFile, unlink } from 'fs/promises'
+import { tmpdir } from 'os'
+import { join } from 'path'
 import type {
   LLMProvider,
   GenerateRequest,
@@ -10,6 +13,7 @@ import type {
   GenerateResponse,
   ProviderCapabilities,
   Message,
+  MessageImage,
 } from '@teya/core'
 
 // ─── Claude Code JSON output types ───────────────────────────────────────────
@@ -94,7 +98,7 @@ export function claudeCode(config: {
     toolCalling: false, // claude code executes tools internally
     parallelToolCalls: false,
     streaming: false,
-    vision: false,
+    vision: true,
     jsonMode: false,
     maxContextTokens: 200_000,
     maxOutputTokens: 16_384,
@@ -106,7 +110,34 @@ export function claudeCode(config: {
     request: GenerateRequest,
     options?: GenerateOptions,
   ): Promise<GenerateResponse> {
-    const prompt = buildPromptWithContext(request.messages)
+    let prompt = buildPromptWithContext(request.messages)
+
+    // Collect attached images from the last user message and dump them to
+    // temp files so Claude Code's Read tool can pick them up. Paths are
+    // appended to the prompt with an instruction to inspect them.
+    const lastUserImages: MessageImage[] = (() => {
+      for (let i = request.messages.length - 1; i >= 0; i--) {
+        const m = request.messages[i]
+        if (m.role === 'user') return m.images ?? []
+      }
+      return []
+    })()
+
+    const imageTempPaths: string[] = []
+    for (let i = 0; i < lastUserImages.length; i++) {
+      const img = lastUserImages[i]
+      const ext = img.mimeType.split('/')[1]?.replace('jpeg', 'jpg') || 'png'
+      const p = join(tmpdir(), `teya-claude-img-${Date.now()}-${i}.${ext}`)
+      await writeFile(p, Buffer.from(img.data, 'base64'))
+      imageTempPaths.push(p)
+    }
+
+    if (imageTempPaths.length > 0) {
+      const list = imageTempPaths.map((p) => `- ${p}`).join('\n')
+      prompt =
+        (prompt || '(see attached images)') +
+        `\n\n<attached_images>\nThe user attached ${imageTempPaths.length} image(s). Read them with the Read tool before answering:\n${list}\n</attached_images>`
+    }
 
     if (!prompt) {
       return {
@@ -131,39 +162,45 @@ export function claudeCode(config: {
       args.push('--permission-mode', permissionMode)
     }
 
-    const result = await runClaudeProcess(binary, args, prompt, cwd, options?.signal)
-
-    let parsed: ClaudeCodeResult | undefined
     try {
-      parsed = JSON.parse(result.stdout.trim()) as ClaudeCodeResult
-    } catch {
-      // fall through — treat raw stdout as content
-    }
+      const result = await runClaudeProcess(binary, args, prompt, cwd, options?.signal)
 
-    if (!parsed) {
-      const content = result.stdout.trim() || result.stderr.trim()
+      let parsed: ClaudeCodeResult | undefined
+      try {
+        parsed = JSON.parse(result.stdout.trim()) as ClaudeCodeResult
+      } catch {
+        // fall through — treat raw stdout as content
+      }
+
+      if (!parsed) {
+        const content = result.stdout.trim() || result.stderr.trim()
+        return {
+          content,
+          usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+          model: model ?? 'claude-code-default',
+          finishReason: result.exitCode === 0 ? 'stop' : 'error',
+        }
+      }
+
+      const content = parsed.result ?? parsed.error ?? ''
+      const inputTokens = parsed.usage?.input_tokens ?? 0
+      const outputTokens = parsed.usage?.output_tokens ?? 0
+      const isError = parsed.is_error === true || parsed.subtype !== 'success'
+
       return {
         content,
-        usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+        usage: {
+          inputTokens,
+          outputTokens,
+          totalTokens: inputTokens + outputTokens,
+        },
         model: model ?? 'claude-code-default',
-        finishReason: result.exitCode === 0 ? 'stop' : 'error',
+        finishReason: isError && !content ? 'error' : 'stop',
       }
-    }
-
-    const content = parsed.result ?? parsed.error ?? ''
-    const inputTokens = parsed.usage?.input_tokens ?? 0
-    const outputTokens = parsed.usage?.output_tokens ?? 0
-    const isError = parsed.is_error === true || parsed.subtype !== 'success'
-
-    return {
-      content,
-      usage: {
-        inputTokens,
-        outputTokens,
-        totalTokens: inputTokens + outputTokens,
-      },
-      model: model ?? 'claude-code-default',
-      finishReason: isError && !content ? 'error' : 'stop',
+    } finally {
+      for (const p of imageTempPaths) {
+        await unlink(p).catch(() => {})
+      }
     }
   }
 

@@ -4,7 +4,7 @@
  * @exports TelegramTransport
  */
 import { Bot, InlineKeyboard } from 'grammy'
-import type { Transport, AgentEvent, MessageContext, MessageSender, MessageChat, KeyboardButton } from '@teya/core'
+import type { Transport, AgentEvent, MessageContext, MessageSender, MessageChat, KeyboardButton, MessageImage } from '@teya/core'
 import { buildSessionId, parseSessionId, type ChatKind } from './session-id.js'
 
 interface SessionStats {
@@ -15,6 +15,7 @@ interface SessionStats {
 
 export class TelegramTransport implements Transport {
   private bot: Bot
+  private token: string
   private messageHandler: ((message: string, ctx: MessageContext) => void) | null = null
   private cancelHandler: ((sessionId: string) => void) | null = null
   private callbackHandler: ((data: string, ctx: MessageContext) => void) | null = null
@@ -24,8 +25,33 @@ export class TelegramTransport implements Transport {
 
   constructor(config: { token: string; allowedChatIds?: number[] }) {
     this.bot = new Bot(config.token)
+    this.token = config.token
     if (config.allowedChatIds?.length) {
       this.allowedChatIds = new Set(config.allowedChatIds)
+    }
+  }
+
+  /** Download a Telegram file by file_id and return it as base64 + MIME type. */
+  private async downloadAsImage(fileId: string, mimeHint?: string): Promise<MessageImage | null> {
+    try {
+      const file = await this.bot.api.getFile(fileId)
+      if (!file.file_path) return null
+      const url = `https://api.telegram.org/file/bot${this.token}/${file.file_path}`
+      const resp = await fetch(url)
+      if (!resp.ok) return null
+      const buf = Buffer.from(await resp.arrayBuffer())
+      const ext = file.file_path.split('.').pop()?.toLowerCase() || 'jpg'
+      const mimeMap: Record<string, string> = {
+        jpg: 'image/jpeg',
+        jpeg: 'image/jpeg',
+        png: 'image/png',
+        gif: 'image/gif',
+        webp: 'image/webp',
+      }
+      const mimeType = mimeHint || mimeMap[ext] || 'image/jpeg'
+      return { data: buf.toString('base64'), mimeType }
+    } catch {
+      return null
     }
   }
 
@@ -174,9 +200,18 @@ export class TelegramTransport implements Transport {
       const chatId = ctx.chat.id
       if (this.allowedChatIds && !this.allowedChatIds.has(chatId)) return
       const route = this.routeFor(ctx)
-      const caption = ctx.message.caption || 'User sent a photo'
+      const caption = ctx.message.caption || ''
+
+      // Telegram sends the same photo at multiple sizes — last one is largest.
+      const photos = ctx.message.photo
+      const largest = photos[photos.length - 1]
+      const img = largest ? await this.downloadAsImage(largest.file_id, 'image/jpeg') : null
+
       if (this.messageHandler) {
-        this.messageHandler(`[Photo received: ${caption}]`, route)
+        this.messageHandler(caption || 'What do you see in this image?', {
+          ...route,
+          images: img ? [img] : undefined,
+        })
       }
     })
 
@@ -184,8 +219,26 @@ export class TelegramTransport implements Transport {
       const chatId = ctx.chat.id
       if (this.allowedChatIds && !this.allowedChatIds.has(chatId)) return
       const route = this.routeFor(ctx)
-      const fileName = ctx.message.document?.file_name || 'unknown'
+      const doc = ctx.message.document
+      const fileName = doc?.file_name || 'unknown'
       const caption = ctx.message.caption || ''
+      const mime = doc?.mime_type || ''
+
+      // Images sent as documents (e.g. full-resolution photos) — download and
+      // attach as vision input. Everything else still goes through as a text
+      // placeholder (Claude Code / codex subprocess can read files from disk
+      // if we later dump them, but plain text is fine for now).
+      if (doc && mime.startsWith('image/')) {
+        const img = await this.downloadAsImage(doc.file_id, mime)
+        if (this.messageHandler) {
+          this.messageHandler(caption || `What do you see in this image? (${fileName})`, {
+            ...route,
+            images: img ? [img] : undefined,
+          })
+        }
+        return
+      }
+
       if (this.messageHandler) {
         this.messageHandler(`[Document received: ${fileName}${caption ? ' — ' + caption : ''}]`, route)
       }
