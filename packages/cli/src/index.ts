@@ -9,7 +9,7 @@ import { join } from 'path'
 import { agentLoop, buildSystemPrompt } from '@teya/core'
 import { loadSkills, buildSkillsMetadata, buildActiveSkillContent } from '@teya/skills'
 import type { Message, LLMProvider, MessageContext, Transport } from '@teya/core'
-import { openrouter, ollama, codex, withToolAdapter, fallback } from '@teya/providers'
+import { openrouter, ollama, codex, claudeCode, withToolAdapter, fallback } from '@teya/providers'
 import { createToolRegistry, registerBuiltins, createMCPManager, createDynamicToolLoader, closeBrowser, initWorkspace, getWorkspaceInfo } from '@teya/tools'
 import { AgentRegistry, createDelegateTool } from '@teya/orchestrator'
 import { CLITransport } from '@teya/transport-cli'
@@ -73,24 +73,34 @@ async function interactiveSetup(): Promise<{ provider: string; model: string; ap
   console.log('  2. Ollama (local models, no API key required)')
   console.log('     Install at: https://ollama.com')
   console.log('  3. Codex (OpenAI Codex CLI — runs as subprocess)')
-  console.log('     Install: npm i -g @openai/codex\n')
+  console.log('     Install: npm i -g @openai/codex')
+  console.log('  4. Claude Code (Anthropic Claude Code CLI — runs as subprocess)')
+  console.log('     Install: npm i -g @anthropic-ai/claude-code\n')
 
-  const providerChoice = await ask(rl, 'Provider (1, 2, or 3)', '1')
+  const providerChoice = await ask(rl, 'Provider (1, 2, 3, or 4)', '1')
   const isOllama = providerChoice.trim() === '2'
   const isCodex = providerChoice.trim() === '3'
+  const isClaudeCode = providerChoice.trim() === '4'
 
-  const provider = isCodex ? 'codex' : isOllama ? 'ollama' : 'openrouter'
-  const defaultModel = isCodex ? '' : isOllama ? 'qwen3:8b' : 'google/gemini-2.0-flash-001'
-  const model = await ask(rl, `Model${isCodex ? ' (empty for codex default)' : ''}`, defaultModel)
+  const provider = isClaudeCode
+    ? 'claude-code'
+    : isCodex
+      ? 'codex'
+      : isOllama
+        ? 'ollama'
+        : 'openrouter'
+  const defaultModel = isCodex || isClaudeCode ? '' : isOllama ? 'qwen3:8b' : 'google/gemini-2.0-flash-001'
+  const subprocessHint = isCodex ? ' (empty for codex default)' : isClaudeCode ? ' (empty for claude default)' : ''
+  const model = await ask(rl, `Model${subprocessHint}`, defaultModel)
 
   let apiKey = ''
-  if (!isOllama && !isCodex) {
+  if (!isOllama && !isCodex && !isClaudeCode) {
     apiKey = await ask(rl, 'API Key (OpenRouter)')
   }
 
   rl.close()
 
-  if (!isOllama && !isCodex && !apiKey) {
+  if (!isOllama && !isCodex && !isClaudeCode && !apiKey) {
     console.error('\nAPI key is required. Get one at https://openrouter.ai/keys')
     process.exit(1)
   }
@@ -208,6 +218,13 @@ if (subcommand === 'scheduler') {
   const { handleSchedulerCommand } = await import('@teya/scheduler')
   await handleSchedulerCommand(process.argv.slice(3))
   process.exit(0)
+}
+
+// PAC / sandbox benchmark runner — drive a BitGN benchmark with Teya's loop.
+if (subcommand === 'pac') {
+  const { pacCli } = await import('@teya/pac')
+  const code = await pacCli(process.argv.slice(3))
+  process.exit(code)
 }
 
 // Trace viewer subcommand — read-only inspection of jsonl traces.
@@ -332,7 +349,7 @@ async function main() {
   let apiKey = args['api-key'] ?? process.env.OPENROUTER_API_KEY ?? process.env.TEYA_API_KEY ?? saved.apiKey ?? ''
 
   // If no config — interactive setup
-  if (!apiKey && providerType !== 'ollama' && providerType !== 'codex') {
+  if (!apiKey && providerType !== 'ollama' && providerType !== 'codex' && providerType !== 'claude-code') {
     const setup = await interactiveSetup()
     providerType = setup.provider
     model = setup.model
@@ -346,12 +363,16 @@ async function main() {
   const codexSandbox = (args['codex-sandbox'] ?? process.env.CODEX_SANDBOX ?? (saved as any).codex?.sandbox ?? 'workspace-write') as 'read-only' | 'workspace-write' | 'danger-full-access'
   const codexFullAuto = codexSandbox !== 'danger-full-access'
 
+  // Claude Code permission mode from config/CLI/env
+  const claudeSkipPerms = (args['claude-skip-permissions'] ?? process.env.CLAUDE_SKIP_PERMISSIONS ?? (saved as any)['claude-code']?.skipPermissions ?? 'true') !== 'false'
+
   // Helper: instantiate a provider by type
   function makeProvider(type: string, mdl: string, key: string, baseUrl?: string): LLMProvider {
     if (type === 'openrouter') return openrouter({ model: mdl, apiKey: key })
     if (type === 'ollama') return withToolAdapter(ollama({ model: mdl, baseUrl }))
     if (type === 'codex') return codex({ model: mdl || undefined, cwd: process.cwd(), sandbox: codexSandbox, fullAuto: codexFullAuto })
-    console.error(`Unknown provider: ${type}. Supported: openrouter, ollama, codex`)
+    if (type === 'claude-code') return claudeCode({ model: mdl || undefined, cwd: process.cwd(), dangerouslySkipPermissions: claudeSkipPerms })
+    console.error(`Unknown provider: ${type}. Supported: openrouter, ollama, codex, claude-code`)
     process.exit(1)
   }
 
@@ -789,7 +810,7 @@ async function main() {
   // Shared by /model readline flow (CLI) and /model inline-keyboard flow (Telegram).
   async function switchModel(
     newModel: string,
-    newType?: 'openrouter' | 'ollama' | 'codex',
+    newType?: 'openrouter' | 'ollama' | 'codex' | 'claude-code',
   ): Promise<void> {
     model = newModel
     const effectiveType = newType || providerType
@@ -799,6 +820,8 @@ async function main() {
       provider = withToolAdapter(ollama({ model }))
     } else if (effectiveType === 'codex') {
       provider = codex({ model: model || undefined, cwd: process.cwd() })
+    } else if (effectiveType === 'claude-code') {
+      provider = claudeCode({ model: model || undefined, cwd: process.cwd() })
     }
     providerType = effectiveType
     const savedCfg = await loadSavedConfig()
@@ -1072,11 +1095,15 @@ async function main() {
           if (isTelegramAny && t.sendKeyboard) {
             await t.sendKeyboard(
               ctx.sessionId,
-              `Текущая: \`${providerType}/${model}\`\n\nВыбери источник:`,
+              `Текущая: \`${providerType}/${model || 'default'}\`\n\nВыбери источник:`,
               [
                 [
                   { label: '📦 Локальные (Ollama)', callbackData: 'model:src:local' },
                   { label: '☁️ OpenRouter', callbackData: 'model:src:or' },
+                ],
+                [
+                  { label: '🤖 Codex CLI', callbackData: 'model:src:codex' },
+                  { label: '✨ Claude Code', callbackData: 'model:src:claude-code' },
                 ],
               ],
             )
@@ -1266,12 +1293,30 @@ Rules:
       return
     }
 
+    if (data === 'model:src:codex') {
+      const presets = ['', 'gpt-5-codex', 'gpt-5', 'o3']
+      const buttons = presets.map((m) => [
+        { label: m ? `🤖 ${m}` : '🤖 default (codex)', callbackData: `model:pick:codex:${m}` },
+      ])
+      await transportAny.sendKeyboard?.(ctx.sessionId, 'Выбери модель Codex:', buttons)
+      return
+    }
+
+    if (data === 'model:src:claude-code') {
+      const presets = ['', 'sonnet', 'opus', 'haiku']
+      const buttons = presets.map((m) => [
+        { label: m ? `✨ ${m}` : '✨ default (claude)', callbackData: `model:pick:claude-code:${m}` },
+      ])
+      await transportAny.sendKeyboard?.(ctx.sessionId, 'Выбери модель Claude Code:', buttons)
+      return
+    }
+
     if (data.startsWith('model:pick:')) {
       const rest = data.slice('model:pick:'.length)
       // Format: "<type>:<model-with-possibly-slashes>"
       const firstColon = rest.indexOf(':')
       if (firstColon === -1) return
-      const type = rest.slice(0, firstColon) as 'ollama' | 'openrouter'
+      const type = rest.slice(0, firstColon) as 'ollama' | 'openrouter' | 'codex' | 'claude-code'
       const modelName = rest.slice(firstColon + 1)
       try {
         await switchModel(modelName, type)
