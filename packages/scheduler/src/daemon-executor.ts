@@ -6,7 +6,7 @@
  */
 import { agentLoop, buildSystemPrompt, runWithSession } from '@teya/core'
 import type { AgentEvent, LLMProvider, ToolResultEntry } from '@teya/core'
-import { openrouter, ollama, withToolAdapter } from '@teya/providers'
+import { openrouter, ollama, withToolAdapter, claudeCode } from '@teya/providers'
 import { createToolRegistry, registerBuiltins, initWorkspace, getWorkspaceInfo } from '@teya/tools'
 import { AgentRegistry, type AgentDef } from '@teya/orchestrator'
 import { KnowledgeGraph, createMemoryTools } from '@teya/memory'
@@ -26,6 +26,15 @@ export interface DaemonExecutorConfig {
 
 /** Handler for a built-in task — receives the task and returns a result string */
 export type BuiltinHandler = (task: Task, signal: AbortSignal) => Promise<string>
+
+function getEffortConfig(priority: string | undefined): { maxTurns: number; maxCostPerSession: number } {
+  switch (priority) {
+    case 'critical': return { maxTurns: 80, maxCostPerSession: 20 }
+    case 'high':     return { maxTurns: 50, maxCostPerSession: 10 }
+    case 'low':      return { maxTurns: 15, maxCostPerSession: 1 }
+    default:         return { maxTurns: 30, maxCostPerSession: 4 }  // medium
+  }
+}
 
 export class DaemonExecutor implements CronEngineExecutor {
   private activeExecutions = new Map<string, Promise<void>>()
@@ -170,12 +179,13 @@ export class DaemonExecutor implements CronEngineExecutor {
       //    Without runWithSession, the agent-loop's sliding-window pass and
       //    core:tool_result_get builtin can't access the per-execution store.
       const prompt = task.prompt || task.description || task.title
+      const effortConfig = getEffortConfig(task.priority)
       const gen = runWithSession({ sessionId: traceSessionId, toolResults }, () => agentLoop(
         {
           provider,
           toolRegistry,
           systemPrompt,
-          config: { maxTurns: 20, maxCostPerSession: 2 },
+          config: effortConfig,
           hooks: {},
         },
         prompt,
@@ -257,9 +267,22 @@ export class DaemonExecutor implements CronEngineExecutor {
     if (pc?.type === 'ollama') {
       return withToolAdapter(ollama({ model: pc.model }))
     }
+    if (pc?.type === 'claude-code') {
+      return claudeCode({ model: pc.model, dangerouslySkipPermissions: true })
+    }
     // Default from global config
     if (this.config.provider === 'ollama') {
       return withToolAdapter(ollama({ model: this.config.model }))
+    }
+    if (this.config.provider === 'claude-code') {
+      // Map short aliases to full model IDs
+      const modelMap: Record<string, string> = {
+        'opus':   'claude-opus-4-5',
+        'sonnet': 'claude-sonnet-4-6',
+        'haiku':  'claude-haiku-4-5',
+      }
+      const model = modelMap[this.config.model] ?? this.config.model
+      return claudeCode({ model, dangerouslySkipPermissions: true })
     }
     return openrouter({ model: this.config.model, apiKey: this.config.apiKey })
   }
