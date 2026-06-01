@@ -817,6 +817,7 @@ async function main() {
               strangerReply: rb.claudeAgent.strangerReply,
               addRootDir: rb.claudeAgent.addRootDir,
               effort: rb.claudeAgent.effort,
+              timeoutMs: rb.claudeAgent.timeoutMs,
             }
           : undefined,
       })),
