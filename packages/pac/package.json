@@ -1,0 +1,32 @@
+{
+  "name": "@teya/pac",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts"
+  },
+  "dependencies": {
+    "@teya/core": "workspace:*",
+    "@teya/providers": "workspace:*",
+    "@teya/tools": "workspace:*",
+    "@teya/tracing": "workspace:*",
+    "@bufbuild/protobuf": "^1.10.0",
+    "@connectrpc/connect": "^1.6.1",
+    "@connectrpc/connect-node": "^1.6.1",
+    "@buf/bitgn_api.bufbuild_es": "1.9.0-20260410191400-90b581d3f32f.2",
+    "@buf/bitgn_api.connectrpc_es": "1.6.1-20260410191400-90b581d3f32f.2"
+  },
+  "devDependencies": {
+    "tsup": "^8.0.0",
+    "typescript": "^5.9.0",
+    "@types/node": "^22.0.0"
+  }
+}

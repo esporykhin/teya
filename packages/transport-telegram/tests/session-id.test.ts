@@ -89,4 +89,67 @@ describe('Telegram session id encoding', () => {
       if (c.userId !== undefined && !c.threadId) expect(parsed?.userId).toBe(String(c.userId))
     }
   })
+
+  describe('multiplexer botName segment', () => {
+    it('encodes botName for a private chat', () => {
+      expect(buildSessionId({ chatId: 12345, chatKind: 'private', botName: 'teya' }))
+        .toBe('tg:12345:bteya')
+    })
+
+    it('encodes botName before a topic segment', () => {
+      expect(buildSessionId({ chatId: 12345, chatKind: 'supergroup', threadId: 678, botName: 'teya' }))
+        .toBe('tg:12345:bteya:t678')
+    })
+
+    it('encodes botName before a per-author segment', () => {
+      expect(buildSessionId({ chatId: 12345, chatKind: 'group', userId: 99, botName: 'ceo' }))
+        .toBe('tg:12345:bceo:u99')
+    })
+
+    it('handles negative group chat ids with a botName', () => {
+      // Telegram supergroup ids are negative; ":" split must still isolate them.
+      const id = buildSessionId({ chatId: -1001234567890, chatKind: 'supergroup', threadId: 42, botName: 'ceo' })
+      expect(id).toBe('tg:-1001234567890:bceo:t42')
+      expect(parseSessionId(id)).toEqual({ chatId: '-1001234567890', botName: 'ceo', threadId: 42 })
+    })
+
+    it('omits botName segment when not provided (backward compatible)', () => {
+      expect(buildSessionId({ chatId: 12345, chatKind: 'private' })).toBe('tg:12345')
+      expect(parseSessionId('tg:12345')).toEqual({ chatId: '12345' })
+    })
+
+    it('rejects botNames with illegal characters (would corrupt routing)', () => {
+      expect(() => buildSessionId({ chatId: 1, chatKind: 'private', botName: 'a:b' })).toThrow()
+      expect(() => buildSessionId({ chatId: 1, chatKind: 'private', botName: 'has space' })).toThrow()
+    })
+
+    it('parse recovers botName so send() can pick the right bot instance', () => {
+      expect(parseSessionId('tg:12345:bteya')).toEqual({ chatId: '12345', botName: 'teya' })
+      expect(parseSessionId('tg:12345:bceo:t678')).toEqual({ chatId: '12345', botName: 'ceo', threadId: 678 })
+      expect(parseSessionId('tg:12345:bceo:u99')).toEqual({ chatId: '12345', botName: 'ceo', userId: '99' })
+    })
+
+    it('two bots in the same chat produce distinct session ids', () => {
+      const a = buildSessionId({ chatId: 12345, chatKind: 'private', botName: 'teya' })
+      const b = buildSessionId({ chatId: 12345, chatKind: 'private', botName: 'ceo' })
+      expect(a).not.toBe(b)
+      expect(parseSessionId(a)?.botName).toBe('teya')
+      expect(parseSessionId(b)?.botName).toBe('ceo')
+    })
+
+    it('round-trips with botName across all chat kinds', () => {
+      const cases = [
+        { chatId: 1, chatKind: 'private' as const, botName: 'teya' },
+        { chatId: 2, chatKind: 'supergroup' as const, threadId: 7, botName: 'teya' },
+        { chatId: 3, chatKind: 'group' as const, userId: 8, botName: 'ceo' },
+      ]
+      for (const c of cases) {
+        const parsed = parseSessionId(buildSessionId(c))
+        expect(parsed?.chatId).toBe(String(c.chatId))
+        expect(parsed?.botName).toBe(c.botName)
+        if (c.threadId) expect(parsed?.threadId).toBe(c.threadId)
+        if (c.userId !== undefined && !c.threadId) expect(parsed?.userId).toBe(String(c.userId))
+      }
+    })
+  })
 })

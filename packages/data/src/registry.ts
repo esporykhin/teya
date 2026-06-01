@@ -11,6 +11,7 @@
 import { join } from 'path'
 import { homedir } from 'os'
 import { DataStore } from './data-store.js'
+import type { EmbeddingProvider } from './data-store.js'
 
 const TEYA_HOME = join(homedir(), '.teya')
 const OWNER_DB = join(TEYA_HOME, 'data.db')
@@ -19,9 +20,11 @@ const GUESTS_ROOT = join(TEYA_HOME, 'guests')
 export class DataStoreRegistry {
   private cache = new Map<string, DataStore>()
   private mainNamespace: string
+  private embeddingProvider?: EmbeddingProvider
 
-  constructor(mainNamespace: string = 'teya') {
+  constructor(mainNamespace: string = 'teya', embeddingProvider?: EmbeddingProvider) {
     this.mainNamespace = mainNamespace
+    this.embeddingProvider = embeddingProvider
   }
 
   for(scopeId: string): DataStore {
@@ -34,7 +37,7 @@ export class DataStoreRegistry {
     // Namespace = scopeId so the DataStore's internal access control
     // doesn't accidentally treat the guest as a foreign tenant inside
     // its own DB.
-    const store = new DataStore(path, scopeId, this.mainNamespace)
+    const store = new DataStore(path, scopeId, this.mainNamespace, this.embeddingProvider)
     this.cache.set(scopeId, store)
     return store
   }

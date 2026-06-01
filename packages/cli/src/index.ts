@@ -13,7 +13,8 @@ import { openrouter, ollama, codex, claudeCode, withToolAdapter, fallback } from
 import { createToolRegistry, registerBuiltins, createMCPManager, createDynamicToolLoader, closeBrowser, initWorkspace, getWorkspaceInfo } from '@teya/tools'
 import { AgentRegistry, createDelegateTool } from '@teya/orchestrator'
 import { CLITransport } from '@teya/transport-cli'
-import { TelegramTransport, TelegramUserbotTransport, createTelegramTool } from '@teya/transport-telegram'
+import { TelegramTransport, TelegramMultiplexerTransport, TelegramUserbotTransport, createTelegramTool } from '@teya/transport-telegram'
+import { loadTelegramMultiConfig, resolveBots, TELEGRAM_MULTI_CONFIG_FILE, type ResolvedBot } from './telegram-multi-config.js'
 import { SessionStore, KnowledgeGraphRegistry, createMemoryTools, AssetStoreRegistry, createAssetTools, ollamaEmbeddings } from '@teya/memory'
 import type { SessionState } from '@teya/core'
 import { AgentTracer, consoleExporter, jsonExporter, sessionFileExporter, compositeExporter, GenerationEnricher } from '@teya/tracing'
@@ -24,7 +25,7 @@ import {
   stop as stopProcess,
   restartAll as restartAllProcesses,
 } from '@teya/runtime'
-import { DataStoreRegistry, createDataTools } from '@teya/data'
+import { DataStoreRegistry, createDataTools, TokenStore } from '@teya/data'
 import {
   runWithIdentity,
   runWithSession,
@@ -125,6 +126,31 @@ if (subcommand === 'telegram') {
     saveConfig,
   })
   process.exit(0)
+}
+
+// teya bots agents | list | add | set-agent | remove — manage the
+// Telegram multiplexer's bot→agent bindings (~/.teya/telegram.json).
+if (subcommand === 'bots') {
+  const action = process.argv[3] || 'help'
+  const { runBotsSubcommand } = await import('./bots-cli.js')
+  await runBotsSubcommand(action, process.argv.slice(4))
+  process.exit(0)
+}
+
+// teya admin — local web control panel for the Telegram multiplexer's
+// bot→agent bindings. Binds to 127.0.0.1 only, password-gated. Reuses the
+// same config core (telegram-multi-config.ts) the `bots` CLI uses.
+if (subcommand === 'admin') {
+  const { runAdminServer } = await import('./admin-server.js')
+  const portArg = process.argv[process.argv.indexOf('--port') + 1]
+  const port = process.argv.includes('--port') && portArg ? Number(portArg) : undefined
+  const handle = await runAdminServer({ port })
+  // Keep the process alive until Ctrl-C; close cleanly on SIGINT.
+  process.on('SIGINT', () => {
+    handle.close().finally(() => process.exit(0))
+  })
+  // Park forever — the http server holds the event loop open.
+  await new Promise(() => {})
 }
 
 if (subcommand === 'skill') {
@@ -307,7 +333,7 @@ if (subcommand === 'eval') {
     const memTools = createMemoryTools(kg)
     toolRegistry.register(memTools.memoryTool)
 
-    const taskStore = new TaskStore()
+    const taskStore = new TaskStore(join(process.env.HOME || '.', '.claude', 'scheduler.db'))
     const taskTools = createTaskTools(taskStore)
     toolRegistry.register(taskTools.tasksTool)
     toolRegistry.register(taskTools.scheduleTool)
@@ -366,12 +392,14 @@ async function main() {
   // Claude Code permission mode from config/CLI/env
   const claudeSkipPerms = (args['claude-skip-permissions'] ?? process.env.CLAUDE_SKIP_PERMISSIONS ?? (saved as any)['claude-code']?.skipPermissions ?? 'true') !== 'false'
 
-  // Helper: instantiate a provider by type
-  function makeProvider(type: string, mdl: string, key: string, baseUrl?: string): LLMProvider {
-    if (type === 'openrouter') return openrouter({ model: mdl, apiKey: key })
-    if (type === 'ollama') return withToolAdapter(ollama({ model: mdl, baseUrl }))
-    if (type === 'codex') return codex({ model: mdl || undefined, cwd: process.cwd(), sandbox: codexSandbox, fullAuto: codexFullAuto })
-    if (type === 'claude-code') return claudeCode({ model: mdl || undefined, cwd: process.cwd(), dangerouslySkipPermissions: claudeSkipPerms })
+  // Helper: instantiate a provider by type. `effort` is a per-bot reasoning
+  // level (default "medium"); each provider maps it to its own knob (openrouter
+  // reasoning.effort, codex model_reasoning_effort) or ignores it (ollama).
+  function makeProvider(type: string, mdl: string, key: string, baseUrl?: string, effort?: 'low' | 'medium' | 'high'): LLMProvider {
+    if (type === 'openrouter') return openrouter({ model: mdl, apiKey: key, effort })
+    if (type === 'ollama') return withToolAdapter(ollama({ model: mdl, baseUrl, effort }))
+    if (type === 'codex') return codex({ model: mdl || undefined, cwd: process.cwd(), sandbox: codexSandbox, fullAuto: codexFullAuto, effort })
+    if (type === 'claude-code') return claudeCode({ model: mdl || undefined, cwd: process.cwd(), dangerouslySkipPermissions: claudeSkipPerms, effort })
     console.error(`Unknown provider: ${type}. Supported: openrouter, ollama, codex, claude-code`)
     process.exit(1)
   }
@@ -483,12 +511,15 @@ async function main() {
 
   // Tasks/scheduler stay single-instance — they're owner-only by permission
   // engine fence (guests cannot schedule background work on the host).
-  const taskStore = new TaskStore()
+  // Claude Code uses its own DB (~/.claude/scheduler.db), separate from the
+  // Teya agent daemon which owns ~/.teya/tasks.db.
+  const CLAUDE_DIR = join(process.env.HOME || process.env.USERPROFILE || '.', '.claude')
+  const taskStore = new TaskStore(join(CLAUDE_DIR, 'scheduler.db'))
   const taskTools = createTaskTools(taskStore)
   toolRegistry.register(taskTools.tasksTool)     // core:tasks
   toolRegistry.register(taskTools.scheduleTool)  // core:schedule
 
-  const dataRegistry = new DataStoreRegistry('teya')
+  const dataRegistry = new DataStoreRegistry('teya', embeddingProvider)
   const dataTools = createDataTools(dataRegistry)
   toolRegistry.register(dataTools.dataTool)      // core:data
 
@@ -719,14 +750,93 @@ async function main() {
   // Create transport
   const telegramToken = args['telegram-token'] || process.env.TELEGRAM_BOT_TOKEN || saved.telegramToken || ''
 
-  let transport: CLITransport | TelegramTransport | TelegramUserbotTransport
-  const transportKind = transportType as 'cli' | 'telegram' | 'telegram-userbot'
-  const isTelegramAny = transportKind === 'telegram' || transportKind === 'telegram-userbot'
+  let transport: CLITransport | TelegramTransport | TelegramMultiplexerTransport | TelegramUserbotTransport
+  const transportKind = transportType as 'cli' | 'telegram' | 'telegram-multi' | 'telegram-userbot'
+  const isMulti = transportKind === 'telegram-multi'
+  const isTelegramAny = transportKind === 'telegram' || transportKind === 'telegram-multi' || transportKind === 'telegram-userbot'
   // True if this teya instance runs as a long-lived background process and
   // should be tracked in @teya/runtime so `teya update` can restart it.
   const isBackgroundProcess = isTelegramAny
 
-  if (transportKind === 'telegram') {
+  /**
+   * Per-bot agent config for the multiplexer. Maps a bot name to the
+   * resolved system prompt + provider + model + allow-list so onMessage can
+   * pick the right persona based on ctx.botName. Empty for non-multi modes.
+   */
+  interface BotAgent {
+    systemPrompt: string
+    provider: LLMProvider
+    model: string
+    allowedChatIds?: Set<number>
+  }
+  const botAgents = new Map<string, BotAgent>()
+
+  if (isMulti) {
+    const cfg = await loadTelegramMultiConfig()
+    // Token precedence: encrypted token-store (by bot name) > token_env env var.
+    // The store is opened read-only-ish for the resolve, then closed — the
+    // multiplexer holds the resolved plaintext tokens in memory, not the store.
+    const tokenStore = new TokenStore()
+    let resolved: ResolvedBot[]
+    try {
+      resolved = resolveBots(cfg, process.env, console.warn, (botName) => tokenStore.getToken(botName))
+    } finally {
+      tokenStore.close()
+    }
+    // Build a per-bot agent: each gets its own SOUL/AGENTS from agentDir and
+    // an optional model override. Provider type + apiKey are shared (the
+    // global default); only the model differs per bot for now.
+    for (const rb of resolved) {
+      // Claude-agent bots are pure transports driven inside the multiplexer
+      // (claude --agent <name>) — they never run the teya agentLoop, so they
+      // get NO botAgents entry / system prompt / teya provider.
+      if (rb.claudeAgent) continue
+      const botModel = rb.model || model
+      const botSystemPrompt = await buildSystemPrompt({
+        agentDir: rb.agentDir || process.cwd(),
+        skillsMetadata: skillsMetadata || undefined,
+        activeSkillContent: activeSkillContent || undefined,
+      }) + '\n\n' + getWorkspaceInfo()
+      botAgents.set(rb.name, {
+        systemPrompt: botSystemPrompt,
+        provider: makeProvider(providerType, botModel, apiKey, args['base-url'], rb.effort),
+        model: botModel,
+        allowedChatIds: rb.allowedChatIds?.length ? new Set(rb.allowedChatIds) : undefined,
+      })
+    }
+    transport = new TelegramMultiplexerTransport(
+      resolved.map((rb) => ({
+        name: rb.name,
+        token: rb.token,
+        allowedChatIds: rb.allowedChatIds,
+        claudeAgent: rb.claudeAgent
+          ? {
+              agent: rb.claudeAgent.agent,
+              cwd: rb.claudeAgent.cwd,
+              model: rb.claudeAgent.model,
+              strangerReply: rb.claudeAgent.strangerReply,
+              addRootDir: rb.claudeAgent.addRootDir,
+              effort: rb.claudeAgent.effort,
+            }
+          : undefined,
+      })),
+    )
+    const claudeBots = resolved.filter(r => r.claudeAgent).map(r => `${r.name}→claude:${r.claudeAgent!.agent}`)
+    if (claudeBots.length) console.log(`\x1b[90m[telegram-multi] claude-agent bots: ${claudeBots.join(', ')}\x1b[0m`)
+    console.log(`\x1b[90m[telegram-multi] config: ${TELEGRAM_MULTI_CONFIG_FILE} — bots: ${resolved.map(r => r.name).join(', ')}\x1b[0m`)
+    // Survivability guard for the long-lived multiplexer: one bot's stray
+    // rejection/exception must never take down the whole process (and with it
+    // the other bots, e.g. Alina). Without this, an unhandled rejection exits
+    // the process, KeepAlive restarts it, it re-pulls the same message and loops
+    // forever. Log and keep serving instead.
+    process.on('unhandledRejection', (reason) => {
+      const msg = reason instanceof Error ? reason.message : String(reason)
+      console.error(`[telegram-multi] unhandledRejection (kept alive): ${msg}`)
+    })
+    process.on('uncaughtException', (err) => {
+      console.error(`[telegram-multi] uncaughtException (kept alive): ${err?.message ?? err}`)
+    })
+  } else if (transportKind === 'telegram') {
     if (!telegramToken) {
       console.error('Telegram token required. Use --telegram-token or set TELEGRAM_BOT_TOKEN')
       process.exit(1)
@@ -785,9 +895,11 @@ async function main() {
   if (isBackgroundProcess) {
     const description = transportKind === 'telegram'
       ? 'Telegram bot (HTTP API)'
-      : transportKind === 'telegram-userbot'
-        ? 'Telegram userbot (MTProto)'
-        : `${transportKind} background process`
+      : transportKind === 'telegram-multi'
+        ? 'Telegram multiplexer (multi-bot HTTP API)'
+        : transportKind === 'telegram-userbot'
+          ? 'Telegram userbot (MTProto)'
+          : `${transportKind} background process`
     registerProcess(transportKind, description)
   }
 
@@ -1123,12 +1235,19 @@ async function main() {
       // Resolve the route — per-topic / per-author isolated session state.
       const route = await getOrLoadRoute(routeKey)
 
+      // Multiplexer: resolve the per-bot agent (persona + provider + model +
+      // allow-list) from ctx.botName. Each bot has its own SOUL/AGENTS and may
+      // override the model. Falls back to the shared global agent otherwise.
+      const botAgent = ctx.botName ? botAgents.get(ctx.botName) : undefined
+      const baseProvider = botAgent?.provider ?? provider
+      const baseSystemPrompt = botAgent?.systemPrompt ?? systemPrompt
+
       // Vision model auto-switch when images are attached. Skipped if the
       // current provider already handles vision natively (claude-code, etc.)
       // — otherwise we'd hijack the turn away from the user's chosen agent.
-      let activeProvider = provider
+      let activeProvider = baseProvider
       const images = ctx.images
-      if (images && images.length > 0 && !provider.capabilities.vision) {
+      if (images && images.length > 0 && !baseProvider.capabilities.vision) {
         const visionMap: Record<string, string> = {
           'z-ai/glm-5-turbo': 'z-ai/glm-5v-turbo',
           'z-ai/glm-5': 'z-ai/glm-5v-turbo',
@@ -1173,7 +1292,7 @@ Rules:
       const ownerPreamble = idCtx.identity.kind === 'owner' && transportType !== 'cli' && ctx.sender
         ? `\n\n## Identity\nYou are talking to your administrator (${ctx.sender.displayName || ctx.sender.username || ctx.sender.id}) via Telegram. Full trust.\n`
         : ''
-      const effectiveSystemPrompt = systemPrompt + guestPreamble + ownerPreamble + '\n\n' + getWorkspaceInfo()
+      const effectiveSystemPrompt = baseSystemPrompt + guestPreamble + ownerPreamble + '\n\n' + getWorkspaceInfo()
 
       // Stamp per-message trace context.
       tracer?.setContext({

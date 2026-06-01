@@ -32,6 +32,9 @@ importers:
       '@teya/orchestrator':
         specifier: workspace:*
         version: link:../orchestrator
+      '@teya/pac':
+        specifier: workspace:*
+        version: link:../pac
       '@teya/providers':
         specifier: workspace:*
         version: link:../providers
@@ -163,6 +166,46 @@ importers:
       '@teya/data':
         specifier: workspace:*
         version: link:../data
+      '@teya/providers':
+        specifier: workspace:*
+        version: link:../providers
+      '@teya/tools':
+        specifier: workspace:*
+        version: link:../tools
+      '@teya/tracing':
+        specifier: workspace:*
+        version: link:../tracing
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.19.17
+      tsup:
+        specifier: ^8.0.0
+        version: 8.5.1(postcss@8.5.8)(typescript@5.9.3)
+      typescript:
+        specifier: ^5.9.0
+        version: 5.9.3
+
+  packages/pac:
+    dependencies:
+      '@buf/bitgn_api.bufbuild_es':
+        specifier: 1.9.0-20260410191400-90b581d3f32f.2
+        version: 1.9.0-20260410191400-90b581d3f32f.2(@bufbuild/protobuf@1.10.1)
+      '@buf/bitgn_api.connectrpc_es':
+        specifier: 1.6.1-20260410191400-90b581d3f32f.2
+        version: 1.6.1-20260410191400-90b581d3f32f.2(@bufbuild/protobuf@1.10.1)(@connectrpc/connect@1.7.0(@bufbuild/protobuf@1.10.1))
+      '@bufbuild/protobuf':
+        specifier: ^1.10.0
+        version: 1.10.1
+      '@connectrpc/connect':
+        specifier: ^1.6.1
+        version: 1.7.0(@bufbuild/protobuf@1.10.1)
+      '@connectrpc/connect-node':
+        specifier: ^1.6.1
+        version: 1.7.0(@bufbuild/protobuf@1.10.1)(@connectrpc/connect@1.7.0(@bufbuild/protobuf@1.10.1))
+      '@teya/core':
+        specifier: workspace:*
+        version: link:../core
       '@teya/providers':
         specifier: workspace:*
         version: link:../providers
@@ -354,6 +397,36 @@ importers:
 
 packages:
 
+  '@buf/bitgn_api.bufbuild_es@1.10.0-20260410191400-90b581d3f32f.1':
+    resolution: {tarball: https://buf.build/gen/npm/v1/@buf/bitgn_api.bufbuild_es/-/bitgn_api.bufbuild_es-1.10.0-20260410191400-90b581d3f32f.1.tgz}
+    peerDependencies:
+      '@bufbuild/protobuf': ^1.10.0
+
+  '@buf/bitgn_api.bufbuild_es@1.9.0-20260410191400-90b581d3f32f.2':
+    resolution: {tarball: https://buf.build/gen/npm/v1/@buf/bitgn_api.bufbuild_es/-/bitgn_api.bufbuild_es-1.9.0-20260410191400-90b581d3f32f.2.tgz}
+    peerDependencies:
+      '@bufbuild/protobuf': ^1.9.0
+
+  '@buf/bitgn_api.connectrpc_es@1.6.1-20260410191400-90b581d3f32f.2':
+    resolution: {tarball: https://buf.build/gen/npm/v1/@buf/bitgn_api.connectrpc_es/-/bitgn_api.connectrpc_es-1.6.1-20260410191400-90b581d3f32f.2.tgz}
+    peerDependencies:
+      '@connectrpc/connect': ^1.6.1
+
+  '@bufbuild/protobuf@1.10.1':
+    resolution: {integrity: sha512-wJ8ReQbHxsAfXhrf9ixl0aYbZorRuOWpBNzm8pL8ftmSxQx/wnJD5Eg861NwJU/czy2VXFIebCeZnZrI9rktIQ==}
+
+  '@connectrpc/connect-node@1.7.0':
+    resolution: {integrity: sha512-6vaPIkG/NyhxlYgytLoR9KYbPhczEboFB2OYWkA9qvUz1K7efXfeGrlRxoLtpa+r8VxyIOw73w5ktNe743nD+A==}
+    engines: {node: '>=16.0.0'}
+    peerDependencies:
+      '@bufbuild/protobuf': ^1.10.0
+      '@connectrpc/connect': 1.7.0
+
+  '@connectrpc/connect@1.7.0':
+    resolution: {integrity: sha512-iNKdJRi69YP3mq6AePRT8F/HrxWCewrhxnLMNm0vpqXAR8biwzRtO6Hjx80C6UvtKJ5sFmffQT7I4Baecz389w==}
+    peerDependencies:
+      '@bufbuild/protobuf': ^1.10.0
+
   '@cryptography/aes@0.1.1':
     resolution: {integrity: sha512-PcYz4FDGblO6tM2kSC+VzhhK62vml6k6/YAkiWtyPvrgJVfnDRoHGDtKn5UiaRRUrvUTTocBpvc2rRgTCqxjsg==}
 
@@ -512,6 +585,10 @@ packages:
     engines: {node: '>=18'}
     cpu: [x64]
     os: [win32]
+
+  '@fastify/busboy@2.1.1':
+    resolution: {integrity: sha512-vBZP4NlzfOlerQTnba4aqZoMhE/a9HY7HRqoOPaETQcSQuWEIyZMHGfVu6w9wGtGK5fED5qRs2DteVCjOH60sA==}
+    engines: {node: '>=14'}
 
   '@grammyjs/types@3.26.0':
     resolution: {integrity: sha512-jlnyfxfev/2o68HlvAGRocAXgdPPX5QabG7jZlbqC2r9DZyWBfzTlg+nu3O3Fy4EhgLWu28hZ/8wr7DsNamP9A==}
@@ -1623,6 +1700,10 @@ packages:
   undici-types@7.18.2:
     resolution: {integrity: sha512-AsuCzffGHJybSaRrmr5eHr81mwJU3kjw6M+uprWvCXiNeN9SOGwQ3Jn8jb8m3Z6izVgknn1R0FTCEAP2QrLY/w==}
 
+  undici@5.29.0:
+    resolution: {integrity: sha512-raqeBD6NQK4SkWhQzeYKd1KmIG6dllBOTt55Rmkt4HtI9mwdWtJljnrXjAFUBLTSN67HWrOIZ3EPF4kjUw80Bg==}
+    engines: {node: '>=14.0'}
+
   unpipe@1.0.0:
     resolution: {integrity: sha512-pjy2bYhSsufwWlKwPc+l3cN7+wuJlK6uz0YdJEOlQDbl6jo/YlPi4mb8agUkVC8BF7V8NuzeyPNqRksA3hztKQ==}
     engines: {node: '>= 0.8'}
@@ -1752,6 +1833,33 @@ packages:
 
 snapshots:
 
+  '@buf/bitgn_api.bufbuild_es@1.10.0-20260410191400-90b581d3f32f.1(@bufbuild/protobuf@1.10.1)':
+    dependencies:
+      '@bufbuild/protobuf': 1.10.1
+
+  '@buf/bitgn_api.bufbuild_es@1.9.0-20260410191400-90b581d3f32f.2(@bufbuild/protobuf@1.10.1)':
+    dependencies:
+      '@bufbuild/protobuf': 1.10.1
+
+  '@buf/bitgn_api.connectrpc_es@1.6.1-20260410191400-90b581d3f32f.2(@bufbuild/protobuf@1.10.1)(@connectrpc/connect@1.7.0(@bufbuild/protobuf@1.10.1))':
+    dependencies:
+      '@buf/bitgn_api.bufbuild_es': 1.10.0-20260410191400-90b581d3f32f.1(@bufbuild/protobuf@1.10.1)
+      '@connectrpc/connect': 1.7.0(@bufbuild/protobuf@1.10.1)
+    transitivePeerDependencies:
+      - '@bufbuild/protobuf'
+
+  '@bufbuild/protobuf@1.10.1': {}
+
+  '@connectrpc/connect-node@1.7.0(@bufbuild/protobuf@1.10.1)(@connectrpc/connect@1.7.0(@bufbuild/protobuf@1.10.1))':
+    dependencies:
+      '@bufbuild/protobuf': 1.10.1
+      '@connectrpc/connect': 1.7.0(@bufbuild/protobuf@1.10.1)
+      undici: 5.29.0
+
+  '@connectrpc/connect@1.7.0(@bufbuild/protobuf@1.10.1)':
+    dependencies:
+      '@bufbuild/protobuf': 1.10.1
+
   '@cryptography/aes@0.1.1': {}
 
   '@esbuild/aix-ppc64@0.27.7':
@@ -1831,6 +1939,8 @@ snapshots:
 
   '@esbuild/win32-x64@0.27.7':
     optional: true
+
+  '@fastify/busboy@2.1.1': {}
 
   '@grammyjs/types@3.26.0': {}
 
@@ -2952,6 +3062,10 @@ snapshots:
   undici-types@6.21.0: {}
 
   undici-types@7.18.2: {}
+
+  undici@5.29.0:
+    dependencies:
+      '@fastify/busboy': 2.1.1
 
   unpipe@1.0.0: {}
 

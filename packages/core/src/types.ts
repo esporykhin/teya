@@ -398,6 +398,12 @@ export interface MessageContext {
   chat?: MessageChat
   /** Optional images attached to the message. */
   images?: MessageImage[]
+  /**
+   * Telegram multiplexer only — which configured bot received this message.
+   * Lets the CLI resolve the per-bot agent (cwd / SOUL / provider) and pick
+   * the right bot instance when sending. Absent for single-bot transports.
+   */
+  botName?: string
 }
 
 export interface MessageSender {

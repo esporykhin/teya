@@ -100,6 +100,42 @@ ${contextLines.join('\n')}
 User: ${lastUserMsg?.content ?? ''}`
 }
 
+// ─── Arg builder ─────────────────────────────────────────────────────────────
+
+/**
+ * Build the argv for a `codex exec` turn. Exported so the reasoning-effort and
+ * sandbox mapping are unit-testable without spawning codex. The final `-` (read
+ * prompt from stdin) and any `-c model_instructions_file=...` override are added
+ * by the caller after this, since they depend on per-request state.
+ */
+export function buildCodexArgs(opts: {
+  model?: string
+  cwd: string
+  sandbox: 'read-only' | 'workspace-write' | 'danger-full-access'
+  fullAuto: boolean
+  effort?: 'low' | 'medium' | 'high'
+}): string[] {
+  const args: string[] = ['exec', '--json', '--skip-git-repo-check']
+
+  if (opts.sandbox === 'danger-full-access') {
+    args.push('--dangerously-bypass-approvals-and-sandbox')
+  } else if (opts.fullAuto) {
+    args.push('--full-auto')
+  } else {
+    args.push('--sandbox', opts.sandbox)
+  }
+
+  if (opts.model) args.push('--model', opts.model)
+  args.push('-C', opts.cwd)
+
+  // Reasoning effort → codex `model_reasoning_effort` config override. Codex
+  // reads this from ~/.codex/config.toml; `-c <dotted.key>=<value>` overrides it
+  // per invocation (value parsed as TOML, falls back to a literal string).
+  if (opts.effort) args.push('-c', `model_reasoning_effort="${opts.effort}"`)
+
+  return args
+}
+
 // ─── Provider factory ────────────────────────────────────────────────────────
 
 export function codex(config: {
@@ -108,12 +144,19 @@ export function codex(config: {
   binary?: string
   sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'
   fullAuto?: boolean
+  /**
+   * Reasoning effort → codex `model_reasoning_effort` config override. Codex
+   * natively supports low/medium/high (and minimal), so this is a direct map
+   * passed via `-c model_reasoning_effort=<level>`. Omitted ⇒ codex default.
+   */
+  effort?: 'low' | 'medium' | 'high'
 }): LLMProvider {
   const binary = config.binary ?? 'codex'
   const model = config.model ?? undefined // use codex default
   const cwd = config.cwd ?? process.cwd()
   const sandbox = config.sandbox ?? 'workspace-write'
   const fullAuto = config.fullAuto ?? true
+  const effort = config.effort
 
   const capabilities: ProviderCapabilities = {
     toolCalling: false, // codex executes tools internally
@@ -150,19 +193,8 @@ export function codex(config: {
       await writeFile(instructionsFile, request.systemPrompt, 'utf-8')
     }
 
-    // Build args
-    const args: string[] = ['exec', '--json', '--skip-git-repo-check']
-
-    if (sandbox === 'danger-full-access') {
-      args.push('--dangerously-bypass-approvals-and-sandbox')
-    } else if (fullAuto) {
-      args.push('--full-auto')
-    } else {
-      args.push('--sandbox', sandbox)
-    }
-
-    if (model) args.push('--model', model)
-    args.push('-C', cwd)
+    // Build args (shared, testable builder) then append per-request extras.
+    const args = buildCodexArgs({ model, cwd, sandbox, fullAuto, effort })
 
     if (instructionsFile) {
       args.push('-c', `model_instructions_file="${instructionsFile}"`)

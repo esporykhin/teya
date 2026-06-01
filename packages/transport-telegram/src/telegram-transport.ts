@@ -4,8 +4,9 @@
  * @exports TelegramTransport
  */
 import { Bot, InlineKeyboard } from 'grammy'
-import type { Transport, AgentEvent, MessageContext, MessageSender, MessageChat, KeyboardButton, MessageImage } from '@teya/core'
+import type { Transport, AgentEvent, MessageContext, MessageSender, MessageChat, KeyboardButton } from '@teya/core'
 import { buildSessionId, parseSessionId, type ChatKind } from './session-id.js'
+import { downloadAsImage, downloadAndTranscribe, sendLongMessage, safeSend } from './telegram-media.js'
 
 interface SessionStats {
   turns: number
@@ -32,27 +33,13 @@ export class TelegramTransport implements Transport {
   }
 
   /** Download a Telegram file by file_id and return it as base64 + MIME type. */
-  private async downloadAsImage(fileId: string, mimeHint?: string): Promise<MessageImage | null> {
-    try {
-      const file = await this.bot.api.getFile(fileId)
-      if (!file.file_path) return null
-      const url = `https://api.telegram.org/file/bot${this.token}/${file.file_path}`
-      const resp = await fetch(url)
-      if (!resp.ok) return null
-      const buf = Buffer.from(await resp.arrayBuffer())
-      const ext = file.file_path.split('.').pop()?.toLowerCase() || 'jpg'
-      const mimeMap: Record<string, string> = {
-        jpg: 'image/jpeg',
-        jpeg: 'image/jpeg',
-        png: 'image/png',
-        gif: 'image/gif',
-        webp: 'image/webp',
-      }
-      const mimeType = mimeHint || mimeMap[ext] || 'image/jpeg'
-      return { data: buf.toString('base64'), mimeType }
-    } catch {
-      return null
-    }
+  private downloadAsImage(fileId: string, mimeHint?: string) {
+    return downloadAsImage(this.bot, this.token, fileId, mimeHint)
+  }
+
+  /** Download a Telegram voice/audio file and transcribe it via mlx_whisper. */
+  private downloadAndTranscribe(fileId: string, ext = 'ogg') {
+    return downloadAndTranscribe(this.bot, this.token, fileId, ext)
   }
 
   onMessage(handler: (message: string, ctx: MessageContext) => void): void {
@@ -244,6 +231,39 @@ export class TelegramTransport implements Transport {
       }
     })
 
+    this.bot.on('message:voice', async (ctx) => {
+      const chatId = ctx.chat.id
+      if (this.allowedChatIds && !this.allowedChatIds.has(chatId)) return
+      const route = this.routeFor(ctx)
+      const caption = ctx.message.caption || ''
+      const voice = ctx.message.voice
+
+      const transcript = voice ? await this.downloadAndTranscribe(voice.file_id, 'ogg') : null
+      if (this.messageHandler) {
+        const text = transcript
+          ? `[Голосовое]: ${transcript}${caption ? '\n' + caption : ''}`
+          : `[Голосовое сообщение]${caption ? ' — ' + caption : ''}`
+        this.messageHandler(text, route)
+      }
+    })
+
+    this.bot.on('message:audio', async (ctx) => {
+      const chatId = ctx.chat.id
+      if (this.allowedChatIds && !this.allowedChatIds.has(chatId)) return
+      const route = this.routeFor(ctx)
+      const audio = ctx.message.audio
+      const caption = ctx.message.caption || ''
+      const ext = audio?.mime_type?.includes('ogg') ? 'ogg' : 'mp3'
+
+      const transcript = audio ? await this.downloadAndTranscribe(audio.file_id, ext) : null
+      if (this.messageHandler) {
+        const text = transcript
+          ? `[Аудио]: ${transcript}${caption ? '\n' + caption : ''}`
+          : `[Аудио: ${audio?.file_name || 'файл'}]${caption ? ' — ' + caption : ''}`
+        this.messageHandler(text, route)
+      }
+    })
+
     // Inline-keyboard button clicks. Build a MessageContext from the
     // underlying message so the CLI handler can route the callback to
     // the right session / identity / route.
@@ -318,40 +338,11 @@ export class TelegramTransport implements Transport {
     return { sessionId, sender, chat }
   }
 
-  private async sendLongMessage(chatId: number, text: string, threadId?: number): Promise<void> {
-    const MAX_LENGTH = 4096
-    if (text.length <= MAX_LENGTH) {
-      await this.safeSend(chatId, text, threadId)
-      return
-    }
-
-    const chunks: string[] = []
-    let current = ''
-    for (const line of text.split('\n')) {
-      if ((current + '\n' + line).length > MAX_LENGTH) {
-        if (current) chunks.push(current)
-        current = line.slice(0, MAX_LENGTH)
-      } else {
-        current = current ? current + '\n' + line : line
-      }
-    }
-    if (current) chunks.push(current)
-
-    for (const chunk of chunks) {
-      await this.safeSend(chatId, chunk, threadId)
-    }
+  private sendLongMessage(chatId: number, text: string, threadId?: number): Promise<void> {
+    return sendLongMessage(this.bot, chatId, text, threadId)
   }
 
-  private async safeSend(chatId: number, text: string, threadId?: number): Promise<void> {
-    const opts = threadId ? { message_thread_id: threadId } : undefined
-    try {
-      await this.bot.api.sendMessage(chatId, text, { parse_mode: 'Markdown', ...opts })
-    } catch {
-      try {
-        await this.bot.api.sendMessage(chatId, text, opts)
-      } catch (err) {
-        console.error(`Failed to send message to ${chatId}:`, err)
-      }
-    }
+  private safeSend(chatId: number, text: string, threadId?: number): Promise<void> {
+    return safeSend(this.bot, chatId, text, threadId)
   }
 }

@@ -415,6 +415,16 @@ export function openrouter(config: {
   model: string
   apiKey: string
   baseUrl?: string
+  /** Disable provider-side reasoning/thinking budget. Needed for models like
+   *  deepseek-v3.2 which otherwise spend minutes in invisible reasoning. */
+  disableReasoning?: boolean
+  /**
+   * Reasoning effort → OpenRouter `reasoning.effort` (OpenAI-compatible). Maps
+   * low/medium/high 1:1. Models that can't vary effort ignore it server-side
+   * (graceful no-op). `disableReasoning` takes precedence when both are set.
+   * Source: https://openrouter.ai/docs/use-cases/reasoning-tokens
+   */
+  effort?: 'low' | 'medium' | 'high'
 }): LLMProvider {
   const baseUrl = config.baseUrl ?? 'https://openrouter.ai/api/v1'
   const endpoint = `${baseUrl}/chat/completions`
@@ -470,6 +480,22 @@ export function openrouter(config: {
 
     if (request.stop && request.stop.length > 0) {
       body.stop = request.stop
+    }
+
+    if (config.disableReasoning) {
+      // OpenRouter reasoning control. `enabled: false` is the documented way
+      // to force-skip extended thinking on models like deepseek-v3.2. For
+      // models that architecturally can't skip (r1, o1, o3, qwen3-thinking)
+      // this is a no-op, but the field itself is safe.
+      // Source: https://openrouter.ai/docs/guides/best-practices/reasoning-tokens
+      // disableReasoning wins over effort — if the owner asked to skip thinking
+      // entirely, a per-bot effort level must not silently re-enable it.
+      body.reasoning = { enabled: false }
+    } else if (config.effort) {
+      // Map reasoning effort to OpenRouter's OpenAI-compatible `reasoning.effort`
+      // (low/medium/high). Non-reasoning models ignore it server-side — a
+      // graceful no-op, not an error.
+      body.reasoning = { effort: config.effort }
     }
 
     const requestBodyText = JSON.stringify(body)
@@ -596,6 +622,22 @@ export function openrouter(config: {
 
     if (request.stop && request.stop.length > 0) {
       body.stop = request.stop
+    }
+
+    if (config.disableReasoning) {
+      // OpenRouter reasoning control. `enabled: false` is the documented way
+      // to force-skip extended thinking on models like deepseek-v3.2. For
+      // models that architecturally can't skip (r1, o1, o3, qwen3-thinking)
+      // this is a no-op, but the field itself is safe.
+      // Source: https://openrouter.ai/docs/guides/best-practices/reasoning-tokens
+      // disableReasoning wins over effort — if the owner asked to skip thinking
+      // entirely, a per-bot effort level must not silently re-enable it.
+      body.reasoning = { enabled: false }
+    } else if (config.effort) {
+      // Map reasoning effort to OpenRouter's OpenAI-compatible `reasoning.effort`
+      // (low/medium/high). Non-reasoning models ignore it server-side — a
+      // graceful no-op, not an error.
+      body.reasoning = { effort: config.effort }
     }
 
     const { response } = await fetchWithRetry(endpoint, {

@@ -31,7 +31,8 @@
     "@teya/scheduler": "workspace:*",
     "@teya/data": "workspace:*",
     "@teya/eval": "workspace:*",
-    "@teya/runtime": "workspace:*"
+    "@teya/runtime": "workspace:*",
+    "@teya/pac": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^25.5.2",

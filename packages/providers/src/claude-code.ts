@@ -77,22 +77,73 @@ ${contextLines.join('\n')}
 User: ${lastUserMsg?.content ?? ''}`
 }
 
+// ─── Arg builder ─────────────────────────────────────────────────────────────
+
+/**
+ * Build the argv for a `claude -p` turn. Two mutually-exclusive shapes:
+ *  - agent mode (`agent` set): `--agent <name>`, NO `--append-system-prompt`
+ *    (the agent's persona file is the system prompt — layering teya's would
+ *    corrupt it).
+ *  - plain mode: `--append-system-prompt <systemPrompt>` if provided.
+ * Exported so the invariant ("agent ⇒ no system prompt flag") is unit-testable.
+ */
+export function buildClaudeCodeArgs(opts: {
+  agent?: string
+  model?: string
+  systemPrompt?: string
+  cwd: string
+  skipPermissions: boolean
+  permissionMode?: 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions'
+  /** Reasoning effort → `claude --effort <level>` (native flag). */
+  effort?: 'low' | 'medium' | 'high'
+}): string[] {
+  const args: string[] = ['-p', '--output-format', 'json']
+  if (opts.model) args.push('--model', opts.model)
+  if (opts.agent) {
+    args.push('--agent', opts.agent)
+    // Intentionally NO --append-system-prompt in agent mode.
+  } else if (opts.systemPrompt) {
+    args.push('--append-system-prompt', opts.systemPrompt)
+  }
+  args.push('--add-dir', opts.cwd)
+  // Reasoning effort. `claude --effort <low|medium|high|...>` is a native CLI
+  // flag (`claude --help`), so a direct 1:1 map. Omitted ⇒ claude's own default.
+  if (opts.effort) args.push('--effort', opts.effort)
+  if (opts.skipPermissions) {
+    args.push('--dangerously-skip-permissions')
+  } else if (opts.permissionMode && opts.permissionMode !== 'default') {
+    args.push('--permission-mode', opts.permissionMode)
+  }
+  return args
+}
+
 // ─── Provider factory ────────────────────────────────────────────────────────
 
 export function claudeCode(config: {
   model?: string
   cwd?: string
   binary?: string
+  /**
+   * Claude Code agent name (~/.claude/agents/<name>.md). When set, the provider
+   * runs `claude --agent <name>` and DOES NOT pass --append-system-prompt: the
+   * agent's own persona file IS the system prompt, so layering teya's on top
+   * would corrupt it. Brains/tools/memory live entirely on the Claude side.
+   */
+  agent?: string
   /** `bypassPermissions` runs fully unattended (equivalent to --dangerously-skip-permissions). */
   permissionMode?: 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions'
   /** Shortcut: if true, passes --dangerously-skip-permissions. Default: true. */
   dangerouslySkipPermissions?: boolean
+  /** Reasoning effort → `claude --effort`. Omitted ⇒ claude default. */
+  effort?: 'low' | 'medium' | 'high'
 }): LLMProvider {
   const binary = config.binary ?? 'claude'
   const model = config.model ?? undefined // use claude default
   const cwd = config.cwd ?? process.cwd()
+  const agent = config.agent
   const permissionMode = config.permissionMode
   const skipPermissions = config.dangerouslySkipPermissions ?? true
+  const effort = config.effort
 
   const capabilities: ProviderCapabilities = {
     toolCalling: false, // claude code executes tools internally
@@ -148,19 +199,15 @@ export function claudeCode(config: {
       }
     }
 
-    const args: string[] = ['-p', '--output-format', 'json']
-
-    if (model) args.push('--model', model)
-    if (request.systemPrompt) {
-      args.push('--append-system-prompt', request.systemPrompt)
-    }
-    args.push('--add-dir', cwd)
-
-    if (skipPermissions) {
-      args.push('--dangerously-skip-permissions')
-    } else if (permissionMode && permissionMode !== 'default') {
-      args.push('--permission-mode', permissionMode)
-    }
+    const args = buildClaudeCodeArgs({
+      agent,
+      model,
+      systemPrompt: request.systemPrompt,
+      cwd,
+      skipPermissions,
+      permissionMode,
+      effort,
+    })
 
     try {
       const result = await runClaudeProcess(binary, args, prompt, cwd, options?.signal)
@@ -222,9 +269,14 @@ function runClaudeProcess(
   signal?: AbortSignal,
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   return new Promise((resolve, reject) => {
+    // Drop CLAUDECODE so a claude-inside-claude invocation doesn't get confused
+    // (same as the claude-agent runner). Everything else inherits.
+    const env = { ...process.env }
+    delete env.CLAUDECODE
     const proc = spawn(binary, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       cwd,
+      env,
     })
 
     let stdout = ''

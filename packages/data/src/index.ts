@@ -1,3 +1,5 @@
 export { DataStore } from './data-store.js'
+export type { EmbeddingProvider } from './data-store.js'
 export { DataStoreRegistry } from './registry.js'
 export { createDataTools } from './tools.js'
+export { TokenStore, loadOrCreateKey, SECRETS_DB_FILE, SECRET_KEY_FILE } from './token-store.js'

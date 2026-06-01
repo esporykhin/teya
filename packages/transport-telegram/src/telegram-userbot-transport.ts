@@ -16,7 +16,7 @@
  * After success the library prints a session string — store it in ~/.teya/config.json
  * as `telegramUserbotSession` to skip auth on subsequent runs.
  */
-import type { Transport, AgentEvent, MessageContext, MessageSender, MessageChat } from '@teya/core'
+import type { Transport, AgentEvent, MessageContext, MessageSender, MessageChat, MessageImage } from '@teya/core'
 import { TelegramClient, Api } from 'telegram'
 import { StringSession } from 'telegram/sessions/index.js'
 import { NewMessage, NewMessageEvent } from 'telegram/events/index.js'
@@ -24,6 +24,7 @@ import * as readline from 'readline'
 import { appendFile, rename, stat } from 'fs/promises'
 import { join } from 'path'
 import { buildSessionId, parseSessionId, type ChatKind } from './session-id.js'
+import { transcribeBuffer } from './transcribe.js'
 
 export interface TelegramUserbotConfig {
   apiId: number
@@ -62,6 +63,15 @@ export class TelegramUserbotTransport implements Transport {
   private cancelHandler: ((sessionId: string) => void) | null = null
   private allowedChatIds?: Set<string>
   private chatQueues: Map<string, { queue: Array<{ text: string; ctx: MessageContext }>; processing: boolean }> = new Map()
+
+  private isVoiceMedia(media: Api.TypeMessageMedia): boolean {
+    if (!(media instanceof Api.MessageMediaDocument)) return false
+    const doc = media.document
+    if (!doc || !('attributes' in doc)) return false
+    return (doc.attributes as Api.TypeDocumentAttribute[]).some(
+      a => a instanceof Api.DocumentAttributeAudio && a.voice === true,
+    )
+  }
   private readonly logFile = join(process.env.HOME || process.env.USERPROFILE || '.', '.teya', 'telegram-userbot.log')
   readonly LOG_MAX_BYTES = 10 * 1024 * 1024  // 10 MB
   ready = false
@@ -201,12 +211,12 @@ export class TelegramUserbotTransport implements Transport {
 
   private async handleIncoming(event: NewMessageEvent): Promise<void> {
     const msg = event.message
-    if (!msg || !msg.message) return
+    if (!msg) return
 
     const chatId = String(msg.chatId ?? msg.peerId?.toString() ?? '')
     if (!chatId) return
 
-    const rawText = msg.message
+    const rawText = msg.message || ''
     const isOutgoing = msg.out === true
 
     // Build the message context — sessionId, sender, chat metadata.
@@ -231,6 +241,7 @@ export class TelegramUserbotTransport implements Transport {
     const respondIncoming = this.cfg.respondToIncoming ?? !!this.allowedChatIds
 
     let payload: string | null = null
+    let images: MessageImage[] | undefined
 
     if (isOutgoing && trigger && rawText.startsWith(trigger)) {
       payload = rawText.slice(trigger.length).trim()
@@ -246,9 +257,37 @@ export class TelegramUserbotTransport implements Transport {
       }
     }
 
+    // Handle media (voice, photo) — may replace or supplement text payload.
+    // Only process when the routing above already accepted this message.
+    if (payload !== null && msg.media) {
+      const media = msg.media
+      if (this.isVoiceMedia(media)) {
+        const buf = await this.client.downloadMedia(msg, {}) as Buffer | null
+        if (buf) {
+          const transcript = await transcribeBuffer(buf, 'ogg')
+          if (transcript) {
+            payload = payload
+              ? `[Голосовое]: ${transcript}\n${payload}`
+              : `[Голосовое]: ${transcript}`
+          } else {
+            payload = payload || '[Голосовое сообщение]'
+          }
+        }
+      } else if (media instanceof Api.MessageMediaPhoto) {
+        const buf = await this.client.downloadMedia(msg, {}) as Buffer | null
+        if (buf) {
+          images = [{ data: buf.toString('base64'), mimeType: 'image/jpeg' }]
+        }
+        if (!payload) payload = 'What do you see in this image?'
+      }
+    }
+
+    // Drop messages with no usable content after media processing.
     if (payload === null || !this.messageHandler) return
 
     this.appendLog({ direction: 'in', chatId, text: payload, messageId: msg.id })
+
+    const richCtx: MessageContext = images ? { ...ctx, images } : ctx
 
     // Per-session queue (not per-chat) — different topics in the same forum
     // run independently. Same topic is still serialized so the agent doesn't
@@ -259,7 +298,7 @@ export class TelegramUserbotTransport implements Transport {
       this.chatQueues.set(ctx.sessionId, entry)
     }
     if (entry.processing) {
-      entry.queue.push({ text: payload, ctx })
+      entry.queue.push({ text: payload, ctx: richCtx })
       return
     }
     entry.processing = true
@@ -276,7 +315,7 @@ export class TelegramUserbotTransport implements Transport {
         entry!.processing = false
       }
     }
-    await processNext(payload, ctx)
+    await processNext(payload, richCtx)
   }
 
   /**

@@ -127,6 +127,13 @@ export function ollama(config: {
   model: string
   baseUrl?: string
   toolCalling?: boolean
+  /**
+   * Reasoning effort. NO-OP for Ollama: the /api/chat options block has no
+   * provider-wide reasoning-effort knob (some models accept a model-specific
+   * `think` flag, but there's no portable low/medium/high mapping). Accepted so
+   * callers can pass it uniformly; intentionally ignored here.
+   */
+  effort?: 'low' | 'medium' | 'high'
 }): LLMProvider {
   const baseUrl = config.baseUrl ?? 'http://localhost:11434'
   const endpoint = `${baseUrl}/api/chat`

@@ -2,6 +2,10 @@ import Database from 'better-sqlite3'
 import { mkdirSync } from 'fs'
 import { dirname } from 'path'
 
+export interface EmbeddingProvider {
+  embed(text: string): Promise<number[]>
+}
+
 export interface ColumnDef {
   name: string
   type: 'text' | 'integer' | 'real' | 'boolean' | 'datetime' | 'json'
@@ -37,10 +41,12 @@ export class DataStore {
   private db: Database.Database
   private namespace: string
   private mainNamespace: string
+  private embeddingProvider?: EmbeddingProvider
 
-  constructor(dbPath: string, namespace: string, mainNamespace: string = 'teya') {
+  constructor(dbPath: string, namespace: string, mainNamespace: string = 'teya', embeddingProvider?: EmbeddingProvider) {
     this.namespace = namespace
     this.mainNamespace = mainNamespace
+    this.embeddingProvider = embeddingProvider
 
     mkdirSync(dirname(dbPath), { recursive: true })
 
@@ -72,6 +78,31 @@ export class DataStore {
         created_at TEXT DEFAULT (datetime('now')),
         PRIMARY KEY (table_name, namespace)
       );
+
+      CREATE TABLE IF NOT EXISTS _embeddings (
+        table_name TEXT NOT NULL,
+        row_id INTEGER NOT NULL,
+        column_name TEXT NOT NULL,
+        embedding BLOB NOT NULL,
+        created_at TEXT DEFAULT (datetime('now')),
+        PRIMARY KEY (table_name, row_id, column_name)
+      );
+
+      CREATE TABLE IF NOT EXISTS _relations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        from_table TEXT NOT NULL,
+        from_id INTEGER NOT NULL,
+        to_table TEXT NOT NULL,
+        to_id INTEGER NOT NULL,
+        label TEXT NOT NULL DEFAULT '',
+        data_json TEXT DEFAULT '{}',
+        created_at TEXT DEFAULT (datetime('now'))
+      );
+    `)
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_relations_from ON _relations (from_table, from_id);
+      CREATE INDEX IF NOT EXISTS idx_relations_to ON _relations (to_table, to_id);
+      CREATE INDEX IF NOT EXISTS idx_relations_label ON _relations (label);
     `)
   }
 
@@ -543,8 +574,178 @@ export class DataStore {
       .join('\n')
   }
 
+  // ── Vector embeddings ──────────────────────────────────────────────────────
+
+  async embedRow(args: Record<string, unknown>): Promise<string> {
+    if (!this.embeddingProvider) {
+      return 'Error: embed_row requires an embedding provider (Ollama must be running).'
+    }
+
+    const table = this.requiredString(args.table, 'table')
+    const id = this.requiredNumber(args.id, 'id')
+    const column = typeof args.column === 'string' ? args.column : 'content'
+
+    this.ensureAccessible(table, 'write')
+
+    let text: string
+    if (typeof args.text === 'string' && args.text.trim()) {
+      text = args.text.trim()
+    } else {
+      const row = this.db.prepare(`SELECT "${column}" FROM "${table}" WHERE id = ?`).get(id) as Record<string, unknown> | undefined
+      if (!row) return `Row #${id} not found in '${table}'.`
+      text = String(row[column] ?? '').trim()
+    }
+
+    if (!text) return 'Error: empty text — nothing to embed.'
+
+    const nums = await this.embeddingProvider.embed(text)
+    const buf = Buffer.from(new Float32Array(nums).buffer)
+
+    this.db.prepare(`
+      INSERT OR REPLACE INTO _embeddings (table_name, row_id, column_name, embedding)
+      VALUES (?, ?, ?, ?)
+    `).run(table, id, column, buf)
+
+    return `Embedding stored for '${table}'#${id}.${column} (${nums.length} dims).`
+  }
+
+  async search(args: Record<string, unknown>): Promise<string> {
+    if (!this.embeddingProvider) {
+      return 'Error: search requires an embedding provider (Ollama must be running).'
+    }
+
+    const table = this.requiredString(args.table, 'table')
+    const query = this.requiredString(args.query, 'query')
+    const column = typeof args.column === 'string' ? args.column : 'content'
+    const rawLimit = typeof args.limit === 'number' ? Math.floor(args.limit) : 5
+    const limit = Math.max(1, Math.min(20, rawLimit))
+    const minScore = typeof args.min_score === 'number' ? args.min_score : 0
+
+    this.ensureAccessible(table, 'read')
+
+    const queryNums = await this.embeddingProvider.embed(query)
+    const queryVec = new Float32Array(queryNums)
+
+    const rows = this.db.prepare(
+      'SELECT row_id, embedding FROM _embeddings WHERE table_name = ? AND column_name = ?'
+    ).all(table, column) as { row_id: number; embedding: Buffer }[]
+
+    if (rows.length === 0) {
+      return `No embeddings found for '${table}.${column}'. Use action=embed_row first.`
+    }
+
+    const scored = rows
+      .map(row => {
+        const vec = new Float32Array(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength / 4)
+        return { row_id: row.row_id, score: this.cosineSimilarity(queryVec, vec) }
+      })
+      .filter(s => s.score >= minScore)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit)
+
+    if (scored.length === 0) return `No results above score ${minScore}.`
+
+    const schema = this.getSchema(table)
+    const lines = [`Top ${scored.length} results for "${query}" in '${table}.${column}':`]
+
+    for (const { row_id, score } of scored) {
+      const row = this.db.prepare(`SELECT * FROM "${table}" WHERE id = ?`).get(row_id) as Record<string, unknown> | undefined
+      if (!row) continue
+      const parsed = this.deserializeRow(row, schema)
+      const pairs = Object.entries(parsed).map(([k, v]) => `${k}=${this.formatValue(v)}`).join(', ')
+      lines.push(`  [${(score * 100).toFixed(1)}%] #${row_id}: ${pairs}`)
+    }
+
+    return lines.join('\n')
+  }
+
+  // ── Graph relations ────────────────────────────────────────────────────────
+
+  relate(args: Record<string, unknown>): string {
+    const fromTable = this.requiredString(args.from_table, 'from_table')
+    const fromId = this.requiredNumber(args.from_id, 'from_id')
+    const toTable = this.requiredString(args.to_table, 'to_table')
+    const toId = this.requiredNumber(args.to_id, 'to_id')
+    const label = typeof args.label === 'string' ? args.label.trim() : ''
+    const data = args.rel_data && typeof args.rel_data === 'object' && !Array.isArray(args.rel_data) ? args.rel_data : {}
+
+    this.ensureAccessible(fromTable, 'write')
+    // To-table needs only read access (creating a link from something you own to something you can read)
+    const toMeta = this.getTableMeta(toTable)
+    if (!toMeta) throw new Error(`Table '${toTable}' not found.`)
+    if (!this.hasAccess(toTable, 'read')) throw new Error(`Access denied: cannot read '${toTable}'.`)
+
+    const result = this.db.prepare(`
+      INSERT INTO _relations (from_table, from_id, to_table, to_id, label, data_json)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(fromTable, fromId, toTable, toId, label, JSON.stringify(data))
+
+    return `Relation #${Number(result.lastInsertRowid)}: ${fromTable}#${fromId} -[${label || 'related'}]-> ${toTable}#${toId}`
+  }
+
+  unrelate(args: Record<string, unknown>): string {
+    const id = this.requiredNumber(args.id, 'id')
+
+    const rel = this.db.prepare('SELECT * FROM _relations WHERE id = ?').get(id) as {
+      from_table: string; from_id: number; to_table: string; to_id: number
+    } | undefined
+
+    if (!rel) return `Relation #${id} not found.`
+    this.ensureAccessible(rel.from_table, 'write')
+
+    this.db.prepare('DELETE FROM _relations WHERE id = ?').run(id)
+    return `Relation #${id} deleted.`
+  }
+
+  related(args: Record<string, unknown>): string {
+    const table = this.requiredString(args.table, 'table')
+    const id = this.requiredNumber(args.id, 'id')
+    const label = typeof args.label === 'string' ? args.label : undefined
+    const direction = typeof args.direction === 'string' ? args.direction : 'both'
+
+    this.ensureAccessible(table, 'read')
+
+    const labelFilter = label ? ' AND label = ?' : ''
+
+    const outRels = direction !== 'in'
+      ? this.db.prepare(`SELECT id, to_table, to_id, label, data_json FROM _relations WHERE from_table = ? AND from_id = ?${labelFilter} ORDER BY created_at DESC`)
+          .all(table, id, ...(label ? [label] : [])) as Array<{ id: number; to_table: string; to_id: number; label: string; data_json: string }>
+      : []
+
+    const inRels = direction !== 'out'
+      ? this.db.prepare(`SELECT id, from_table, from_id, label, data_json FROM _relations WHERE to_table = ? AND to_id = ?${labelFilter} ORDER BY created_at DESC`)
+          .all(table, id, ...(label ? [label] : [])) as Array<{ id: number; from_table: string; from_id: number; label: string; data_json: string }>
+      : []
+
+    if (outRels.length === 0 && inRels.length === 0) {
+      return `No relations for ${table}#${id}${label ? ` with label '${label}'` : ''}.`
+    }
+
+    const lines = [`Relations for ${table}#${id}:`]
+    for (const r of outRels) {
+      lines.push(`  -> ${r.to_table}#${r.to_id} [${r.label || 'related'}] (relation #${r.id})`)
+    }
+    for (const r of inRels) {
+      lines.push(`  <- ${r.from_table}#${r.from_id} [${r.label || 'related'}] (relation #${r.id})`)
+    }
+
+    return lines.join('\n')
+  }
+
   close(): void {
     this.db.close()
+  }
+
+  private cosineSimilarity(a: Float32Array, b: Float32Array): number {
+    const len = Math.min(a.length, b.length)
+    let dot = 0, normA = 0, normB = 0
+    for (let i = 0; i < len; i++) {
+      dot += a[i] * b[i]
+      normA += a[i] * a[i]
+      normB += b[i] * b[i]
+    }
+    const denom = Math.sqrt(normA) * Math.sqrt(normB)
+    return denom === 0 ? 0 : dot / denom
   }
 
   private satisfiesAccess(current: AccessLevel, required: RequiredAccess): boolean {

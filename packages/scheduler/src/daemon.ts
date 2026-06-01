@@ -62,8 +62,8 @@ async function main(): Promise<void> {
     log('No config.json found — will use agent-level provider configs only')
   }
 
-  // 3. Task store
-  const store = new TaskStore()
+  // 3. Task store — daemon owns ~/.teya/tasks.db exclusively
+  const store = new TaskStore(join(CONFIG_DIR, 'tasks.db'))
   const orphaned = store.cleanupOrphanedExecutions()
   if (orphaned > 0) log(`Cleaned ${orphaned} orphaned executions`)
   const pruned = store.pruneExecutions(30)
